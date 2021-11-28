@@ -371,6 +371,11 @@ fn build_grid_mesh_into(dest: &mut [[peridot::ColoredVertex; 2]]) {
     );
 }
 
+fn normalize3(v: peridot::math::Vector4<f32>) -> peridot::math::Vector4F32 {
+    let peridot::math::Vector3(x, y, z) = peridot::math::Vector3::from(v).normalize();
+    peridot::math::Vector4(x, y, z, 1.0)
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct VertexWithNormals {
@@ -379,12 +384,12 @@ pub struct VertexWithNormals {
     tangent: peridot::math::Vector4F32,
     binormal: peridot::math::Vector4F32,
 }
-pub struct IndexedMesh {
+pub struct UnitIcosphere {
     pub vertices: Vec<VertexWithNormals>,
     pub indices: Vec<u16>,
 }
-impl IndexedMesh {
-    pub fn icosphere_base() -> Self {
+impl UnitIcosphere {
+    pub fn base() -> Self {
         // recip of golden number(short side)
         let ph = 2.0f32 / (1.0f32 + 5.0f32.sqrt());
 
@@ -406,11 +411,6 @@ impl IndexedMesh {
             peridot::math::Vector4(0.0, 1.0, ph, 1.0),
             peridot::math::Vector4(0.0, 1.0, -ph, 1.0),
         ];
-
-        fn normalize3(v: peridot::math::Vector4<f32>) -> peridot::math::Vector4F32 {
-            let peridot::math::Vector3(x, y, z) = peridot::math::Vector3::from(v).normalize();
-            peridot::math::Vector4(x, y, z, 1.0)
-        }
 
         Self {
             vertices: xz_planes
@@ -444,6 +444,52 @@ impl IndexedMesh {
             ],
         }
     }
+
+    pub fn subdivide(&self) -> Self {
+        let mut midpoints = std::collections::HashMap::<(u16, u16), u16>::new();
+        let mut vertices = self.vertices.clone();
+        let mut midpoint_index = |index1: u16, index2: u16| {
+            *midpoints.entry((index1, index2)).or_insert_with(|| {
+                let index = vertices.len() as u16;
+                let p = normalize3(
+                    (vertices[index1 as usize].pos + vertices[index2 as usize].pos) * 0.5,
+                );
+
+                let n3 = peridot::math::Vector3::from(p.clone()).normalize();
+                let ax = peridot::math::Vector3::up().cross(&n3);
+                let q = peridot::math::Quaternion(
+                    ax.0,
+                    ax.1,
+                    ax.2,
+                    1.0 + peridot::math::Vector3::up().dot(n3.clone()),
+                )
+                .normalize();
+                let rot = peridot::math::Matrix4::from(q);
+
+                vertices.push(VertexWithNormals {
+                    normal: peridot::math::Vector4(n3.0, n3.1, n3.2, 0.0),
+                    tangent: rot.clone() * peridot::math::Vector4(1.0, 0.0, 0.0, 0.0),
+                    binormal: rot * peridot::math::Vector4(0.0, 0.0, 1.0, 0.0),
+                    pos: p,
+                });
+
+                index
+            })
+        };
+        let mut indices = Vec::new();
+
+        for tri in self.indices.chunks_exact(3) {
+            let mp01 = midpoint_index(tri[0], tri[1]);
+            let mp12 = midpoint_index(tri[1], tri[2]);
+            let mp20 = midpoint_index(tri[2], tri[0]);
+
+            indices.extend(vec![
+                tri[0], mp20, mp01, tri[1], mp12, mp01, tri[2], mp20, mp12, mp01, mp12, mp20,
+            ]);
+        }
+
+        Self { vertices, indices }
+    }
 }
 
 pub struct MutableBufferOffsets {
@@ -460,7 +506,7 @@ pub struct StaticBufferOffsets {
 }
 pub struct StaticBufferInitializer<'o> {
     offsets: &'o StaticBufferOffsets,
-    icosphere: &'o IndexedMesh,
+    icosphere: &'o UnitIcosphere,
 }
 impl peridot::FixedBufferInitializer for StaticBufferInitializer<'_> {
     fn stage_data(&mut self, m: &br::MappedMemoryRange) {
@@ -694,7 +740,7 @@ impl Memory {
         e: &peridot::Engine<impl peridot::NativeLinker>,
         tfb: &mut peridot::TransferBatch,
     ) -> Self {
-        let icosphere = IndexedMesh::icosphere_base();
+        let icosphere = UnitIcosphere::base().subdivide().subdivide();
 
         let mut static_bp = peridot::BufferPrealloc::new(e.graphics());
         let offsets = StaticBufferOffsets {
@@ -960,14 +1006,14 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             e.graphics(),
             RasterizationDirectionalLightInfo {
                 dir: -peridot::math::Vector4(0.2f32, 0.3, 0.5, 0.0).normalize(),
-                intensity: peridot::math::Vector4(1.0, 1.0, 1.0, 1.0),
+                intensity: peridot::math::Vector4(2.0, 2.0, 2.0, 1.0),
             },
         );
         mem.set_material(
             e.graphics(),
             MaterialInfo {
                 base_color: peridot::math::Vector4(1.0, 0.0, 0.0, 1.0),
-                roughness: 0.0,
+                roughness: 0.3,
                 anisotropic: 0.0,
                 metallic: 0.0,
             },
