@@ -38,7 +38,7 @@ Header[FragmentShader] {
 
     // Schlicks approximation method
     vec3 Fresnel(vec3 outDir, vec3 h, vec3 albedo) {
-        const vec3 f0 = mix(vec3(0.04), albedo, metallic);
+        const vec3 f0 = 0.16 * reflectance * reflectance * (1.0 - metallic) + albedo * metallic;
 
         return f0 + (1.0 - f0) * pow(1.0 - dot(outDir, h), 5.0);
     }
@@ -87,5 +87,5 @@ Uniform[FragmentShader](1, 1) DirectionalLight {
 }
 Uniform[FragmentShader](2, 0) Material {
     vec4 baseColor;
-    float roughness, anisotropic, metallic;
+    float roughness, anisotropic, metallic, reflectance;
 }

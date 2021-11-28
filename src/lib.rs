@@ -26,6 +26,7 @@ pub struct MaterialInfo {
     roughness: f32,
     anisotropic: f32,
     metallic: f32,
+    reflectance: f32,
 }
 
 pub struct ConstResources {
@@ -740,7 +741,7 @@ impl Memory {
         e: &peridot::Engine<impl peridot::NativeLinker>,
         tfb: &mut peridot::TransferBatch,
     ) -> Self {
-        let icosphere = UnitIcosphere::base().subdivide().subdivide();
+        let icosphere = UnitIcosphere::base().subdivide().subdivide().subdivide();
 
         let mut static_bp = peridot::BufferPrealloc::new(e.graphics());
         let offsets = StaticBufferOffsets {
@@ -845,7 +846,6 @@ impl Memory {
         }
 
         if let Some(o) = self.update_sets.object_mvp_stg_offset.take() {
-            println!("object_mvp_stg_offset: {}", o);
             let r = self.object_transform_range();
 
             tfb.add_copying_buffer(
@@ -1013,9 +1013,10 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             e.graphics(),
             MaterialInfo {
                 base_color: peridot::math::Vector4(1.0, 0.0, 0.0, 1.0),
-                roughness: 0.3,
+                roughness: 0.4,
                 anisotropic: 0.0,
                 metallic: 0.0,
+                reflectance: 0.5,
             },
         );
         mem.ready_transfer(e.graphics(), &mut tfb);
