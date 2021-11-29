@@ -6,6 +6,10 @@ use peridot;
 use peridot::math::One;
 use peridot_vertex_processing_pack::*;
 
+mod mesh;
+mod staging;
+use self::staging::DynamicStagingBuffer;
+
 #[repr(C)]
 pub struct ObjectTransform {
     mvp: peridot::math::Matrix4F32,
@@ -292,207 +296,6 @@ impl ScreenResources {
     }
 }
 
-const GRID_SIZE: usize = 10;
-const GRID_AXIS_LENGTH: f32 = 100.0;
-const fn colored_line_mesh(
-    from: peridot::math::Vector4F32,
-    to: peridot::math::Vector4F32,
-    color: peridot::math::Vector4F32,
-) -> [peridot::ColoredVertex; 2] {
-    [
-        peridot::ColoredVertex { pos: from, color },
-        peridot::ColoredVertex { pos: to, color },
-    ]
-}
-const GRID_MESH_LINE_COUNT: usize = (GRID_SIZE * 2) * (GRID_SIZE * 2) + 2 + 3;
-fn build_grid_mesh_into(dest: &mut [[peridot::ColoredVertex; 2]]) {
-    use peridot::math::Vector4;
-
-    let mut ptr = 0;
-
-    for x in 1..=GRID_SIZE {
-        dest[ptr] = colored_line_mesh(
-            Vector4(x as f32, 0.0, -(GRID_SIZE as f32), 1.0),
-            Vector4(x as f32, 0.0, GRID_SIZE as f32, 1.0),
-            Vector4(0.375, 0.375, 0.375, 1.0),
-        );
-        ptr += 1;
-
-        dest[ptr] = colored_line_mesh(
-            Vector4(-(x as f32), 0.0, -(GRID_SIZE as f32), 1.0),
-            Vector4(-(x as f32), 0.0, GRID_SIZE as f32, 1.0),
-            Vector4(0.375, 0.375, 0.375, 1.0),
-        );
-        ptr += 1;
-
-        dest[ptr] = colored_line_mesh(
-            Vector4(-(GRID_SIZE as f32), 0.0, -(x as f32), 1.0),
-            Vector4(GRID_SIZE as f32, 0.0, -(x as f32), 1.0),
-            Vector4(0.375, 0.375, 0.375, 1.0),
-        );
-        ptr += 1;
-
-        dest[ptr] = colored_line_mesh(
-            Vector4(-(GRID_SIZE as f32), 0.0, x as f32, 1.0),
-            Vector4(GRID_SIZE as f32, 0.0, x as f32, 1.0),
-            Vector4(0.375, 0.375, 0.375, 1.0),
-        );
-        ptr += 1;
-    }
-
-    dest[ptr] = colored_line_mesh(
-        Vector4(0.0, 0.0, -(GRID_SIZE as f32), 1.0),
-        Vector4(0.0, 0.0, GRID_SIZE as f32, 1.0),
-        Vector4(0.375, 0.375, 0.375, 1.0),
-    );
-    ptr += 1;
-    dest[ptr] = colored_line_mesh(
-        Vector4(-(GRID_SIZE as f32), 0.0, 0.0, 1.0),
-        Vector4(GRID_SIZE as f32, 0.0, 0.0, 1.0),
-        Vector4(0.375, 0.375, 0.375, 1.0),
-    );
-    ptr += 1;
-
-    dest[ptr] = colored_line_mesh(
-        Vector4(0.0, 0.0, 0.0, 1.0),
-        Vector4(GRID_AXIS_LENGTH as f32, 0.0, 0.0, 1.0),
-        Vector4(1.0, 0.0, 0.0, 1.0),
-    );
-    ptr += 1;
-    dest[ptr] = colored_line_mesh(
-        Vector4(0.0, 0.0, 0.0, 1.0),
-        Vector4(0.0, GRID_AXIS_LENGTH as f32, 0.0, 1.0),
-        Vector4(0.0, 1.0, 0.0, 1.0),
-    );
-    ptr += 1;
-    dest[ptr] = colored_line_mesh(
-        Vector4(0.0, 0.0, 0.0, 1.0),
-        Vector4(0.0, 0.0, GRID_AXIS_LENGTH as f32, 1.0),
-        Vector4(0.0, 0.0, 1.0, 1.0),
-    );
-}
-
-fn normalize3(v: peridot::math::Vector4<f32>) -> peridot::math::Vector4F32 {
-    let peridot::math::Vector3(x, y, z) = peridot::math::Vector3::from(v).normalize();
-    peridot::math::Vector4(x, y, z, 1.0)
-}
-
-#[repr(C)]
-#[derive(Clone)]
-pub struct VertexWithNormals {
-    pos: peridot::math::Vector4F32,
-    normal: peridot::math::Vector4F32,
-    tangent: peridot::math::Vector4F32,
-    binormal: peridot::math::Vector4F32,
-}
-pub struct UnitIcosphere {
-    pub vertices: Vec<VertexWithNormals>,
-    pub indices: Vec<u16>,
-}
-impl UnitIcosphere {
-    pub fn base() -> Self {
-        // recip of golden number(short side)
-        let ph = 2.0f32 / (1.0f32 + 5.0f32.sqrt());
-
-        let xz_planes = vec![
-            peridot::math::Vector4(-ph, 0.0, -1.0, 1.0),
-            peridot::math::Vector4(ph, 0.0, -1.0, 1.0),
-            peridot::math::Vector4(ph, 0.0, 1.0, 1.0),
-            peridot::math::Vector4(-ph, 0.0, 1.0, 1.0),
-        ];
-        let xy_planes = vec![
-            peridot::math::Vector4(-1.0, -ph, 0.0, 1.0),
-            peridot::math::Vector4(-1.0, ph, 0.0, 1.0),
-            peridot::math::Vector4(1.0, ph, 0.0, 1.0),
-            peridot::math::Vector4(1.0, -ph, 0.0, 1.0),
-        ];
-        let yz_planes = vec![
-            peridot::math::Vector4(0.0, -1.0, -ph, 1.0),
-            peridot::math::Vector4(0.0, -1.0, ph, 1.0),
-            peridot::math::Vector4(0.0, 1.0, ph, 1.0),
-            peridot::math::Vector4(0.0, 1.0, -ph, 1.0),
-        ];
-
-        Self {
-            vertices: xz_planes
-                .into_iter()
-                .chain(xy_planes.into_iter())
-                .chain(yz_planes.into_iter())
-                .map(|p| {
-                    let n3 = peridot::math::Vector3::from(p.clone()).normalize();
-                    let ax = peridot::math::Vector3::up().cross(&n3);
-                    let q = peridot::math::Quaternion(
-                        ax.0,
-                        ax.1,
-                        ax.2,
-                        1.0 + peridot::math::Vector3::up().dot(n3.clone()),
-                    )
-                    .normalize();
-                    let rot = peridot::math::Matrix4::from(q);
-
-                    VertexWithNormals {
-                        normal: peridot::math::Vector4(n3.0, n3.1, n3.2, 0.0),
-                        tangent: rot.clone() * peridot::math::Vector4(1.0, 0.0, 0.0, 0.0),
-                        binormal: rot * peridot::math::Vector4(0.0, 0.0, 1.0, 0.0),
-                        pos: normalize3(p),
-                    }
-                })
-                .collect(),
-            indices: vec![
-                0, 1, 8, 0, 1, 11, 2, 3, 9, 2, 3, 10, 4, 5, 0, 4, 5, 3, 6, 7, 1, 6, 7, 2, 8, 9, 4,
-                8, 9, 7, 10, 11, 5, 10, 11, 6, 8, 0, 4, 8, 1, 7, 11, 0, 5, 11, 1, 6, 9, 2, 7, 9, 3,
-                4, 10, 2, 6, 10, 3, 5,
-            ],
-        }
-    }
-
-    pub fn subdivide(&self) -> Self {
-        let mut midpoints = std::collections::HashMap::<(u16, u16), u16>::new();
-        let mut vertices = self.vertices.clone();
-        let mut midpoint_index = |index1: u16, index2: u16| {
-            *midpoints.entry((index1, index2)).or_insert_with(|| {
-                let index = vertices.len() as u16;
-                let p = normalize3(
-                    (vertices[index1 as usize].pos + vertices[index2 as usize].pos) * 0.5,
-                );
-
-                let n3 = peridot::math::Vector3::from(p.clone()).normalize();
-                let ax = peridot::math::Vector3::up().cross(&n3);
-                let q = peridot::math::Quaternion(
-                    ax.0,
-                    ax.1,
-                    ax.2,
-                    1.0 + peridot::math::Vector3::up().dot(n3.clone()),
-                )
-                .normalize();
-                let rot = peridot::math::Matrix4::from(q);
-
-                vertices.push(VertexWithNormals {
-                    normal: peridot::math::Vector4(n3.0, n3.1, n3.2, 0.0),
-                    tangent: rot.clone() * peridot::math::Vector4(1.0, 0.0, 0.0, 0.0),
-                    binormal: rot * peridot::math::Vector4(0.0, 0.0, 1.0, 0.0),
-                    pos: p,
-                });
-
-                index
-            })
-        };
-        let mut indices = Vec::new();
-
-        for tri in self.indices.chunks_exact(3) {
-            let mp01 = midpoint_index(tri[0], tri[1]);
-            let mp12 = midpoint_index(tri[1], tri[2]);
-            let mp20 = midpoint_index(tri[2], tri[0]);
-
-            indices.extend(vec![
-                tri[0], mp20, mp01, tri[1], mp12, mp01, tri[2], mp20, mp12, mp01, mp12, mp20,
-            ]);
-        }
-
-        Self { vertices, indices }
-    }
-}
-
 pub struct MutableBufferOffsets {
     grid_mvp: u64,
     object_mvp: u64,
@@ -507,16 +310,16 @@ pub struct StaticBufferOffsets {
 }
 pub struct StaticBufferInitializer<'o> {
     offsets: &'o StaticBufferOffsets,
-    icosphere: &'o UnitIcosphere,
+    icosphere: &'o mesh::UnitIcosphere,
 }
 impl peridot::FixedBufferInitializer for StaticBufferInitializer<'_> {
     fn stage_data(&mut self, m: &br::MappedMemoryRange) {
         unsafe {
             let grid_range = m.slice_mut::<[peridot::ColoredVertex; 2]>(
                 self.offsets.grid as _,
-                GRID_MESH_LINE_COUNT,
+                mesh::GRID_MESH_LINE_COUNT,
             );
-            build_grid_mesh_into(grid_range);
+            mesh::build_grid_mesh_into(grid_range);
 
             m.slice_mut(
                 self.offsets.icosphere_vertices as _,
@@ -543,169 +346,6 @@ impl peridot::FixedBufferInitializer for StaticBufferInitializer<'_> {
             self.offsets.grid..range.end,
             br::AccessFlags::VERTEX_ATTRIBUTE_READ,
         );
-    }
-}
-
-pub struct DynamicStagingBuffer {
-    buffer: peridot::Buffer,
-    mapped: Option<std::ptr::NonNull<u8>>,
-    require_explicit_flushing: bool,
-    cap: u64,
-    top: u64,
-}
-impl DynamicStagingBuffer {
-    const DEFAULT_INIT_CAP: u64 = 128;
-
-    pub fn new(e: &peridot::Graphics) -> br::Result<Self> {
-        let buffer =
-            br::BufferDesc::new(Self::DEFAULT_INIT_CAP as _, br::BufferUsage::TRANSFER_SRC)
-                .create(e)?;
-        let mreq = buffer.requirements();
-        let mtype = e
-            .memory_type_manager
-            .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::HOST_COHERENT)
-            .or_else(|| {
-                e.memory_type_manager
-                    .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::EMPTY)
-            })
-            .expect("no matching memory for staging buffer");
-        let memory = br::DeviceMemory::allocate(e, mreq.size as _, mtype.index())?;
-        let buffer = peridot::Buffer::bound(buffer, &std::rc::Rc::new(memory), 0)?;
-
-        Ok(Self {
-            buffer,
-            mapped: None,
-            require_explicit_flushing: !mtype.is_host_coherent(),
-            cap: Self::DEFAULT_INIT_CAP,
-            top: 0,
-        })
-    }
-
-    pub fn clear(&mut self) {
-        self.top = 0;
-    }
-
-    fn mapped(&mut self) -> std::ptr::NonNull<u8> {
-        match self.mapped {
-            Some(p) => p,
-            None => {
-                let mapped = self.buffer.map(0..self.cap).expect("Failed to map memory");
-                let p =
-                    unsafe { std::ptr::NonNull::new_unchecked(mapped.get_mut::<u8>(0) as *mut _) };
-                self.mapped = Some(p);
-                p
-            }
-        }
-    }
-
-    fn end_mapped(&mut self, e: &peridot::Graphics) {
-        if let Some(_) = self.mapped.take() {
-            if self.require_explicit_flushing {
-                unsafe {
-                    e.flush_mapped_memory_ranges(&[br::vk::VkMappedMemoryRange {
-                        memory: self.buffer.memory().native_ptr(),
-                        offset: 0,
-                        size: self.cap,
-                        ..Default::default()
-                    }])
-                    .expect("Failed to flush memory range");
-                }
-            }
-
-            unsafe {
-                self.buffer.unmap();
-            }
-        }
-    }
-
-    fn resize(&mut self, e: &peridot::Graphics, new_size: u64) -> br::Result<()> {
-        self.end_mapped(e);
-
-        let buffer =
-            br::BufferDesc::new(new_size as _, br::BufferUsage::TRANSFER_SRC.transfer_dest())
-                .create(e)?;
-        let mreq = buffer.requirements();
-        let mtype = e
-            .memory_type_manager
-            .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::HOST_COHERENT)
-            .or_else(|| {
-                e.memory_type_manager
-                    .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::EMPTY)
-            })
-            .expect("no matching memory for staging buffer");
-        let memory = br::DeviceMemory::allocate(e, mreq.size as _, mtype.index())?;
-        let buffer = peridot::Buffer::bound(buffer, &std::rc::Rc::new(memory), 0)?;
-
-        e.submit_commands(|r| {
-            let buffers_in = &[
-                br::BufferMemoryBarrier::new(
-                    &buffer,
-                    0..new_size,
-                    0,
-                    br::AccessFlags::TRANSFER.write,
-                )
-                .into(),
-                br::BufferMemoryBarrier::new(
-                    &self.buffer,
-                    0..self.cap,
-                    br::AccessFlags::HOST.write,
-                    br::AccessFlags::TRANSFER.read,
-                )
-                .into(),
-            ];
-            let buffers_out = &[br::BufferMemoryBarrier::new(
-                &buffer,
-                0..new_size,
-                br::AccessFlags::TRANSFER.write,
-                br::AccessFlags::HOST.write,
-            )];
-            let copy_region = br::vk::VkBufferCopy {
-                srcOffset: 0,
-                dstOffset: 0,
-                size: self.cap,
-            };
-
-            r.pipeline_barrier(
-                br::PipelineStageFlags::HOST,
-                br::PipelineStageFlags::TRANSFER,
-                false,
-                &[],
-                buffers_in,
-                &[],
-            )
-            .copy_buffer(&self.buffer, &buffer, &[copy_region])
-            .pipeline_barrier(
-                br::PipelineStageFlags::TRANSFER,
-                br::PipelineStageFlags::HOST,
-                false,
-                &[],
-                buffers_out,
-                &[],
-            );
-        })?;
-
-        self.cap = new_size;
-        self.buffer = buffer;
-        self.require_explicit_flushing = !mtype.is_host_coherent();
-
-        Ok(())
-    }
-
-    /// returns placement of the value
-    pub fn push<T>(&mut self, e: &peridot::Graphics, value: T) -> u64 {
-        if self.top + std::mem::size_of::<T>() as u64 > self.cap {
-            self.resize(e, self.cap * 2)
-                .expect("Failed to resize dynamic staging buffer");
-        }
-
-        let p = self.mapped();
-        let placement = self.top;
-        self.top = placement + std::mem::size_of::<T>() as u64;
-        unsafe {
-            std::ptr::write(p.as_ptr().add(placement as _) as *mut T, value);
-        }
-
-        placement
     }
 }
 
@@ -741,16 +381,19 @@ impl Memory {
         e: &peridot::Engine<impl peridot::NativeLinker>,
         tfb: &mut peridot::TransferBatch,
     ) -> Self {
-        let icosphere = UnitIcosphere::base().subdivide().subdivide().subdivide();
+        let icosphere = mesh::UnitIcosphere::base()
+            .subdivide()
+            .subdivide()
+            .subdivide();
 
         let mut static_bp = peridot::BufferPrealloc::new(e.graphics());
         let offsets = StaticBufferOffsets {
             grid: static_bp.add(peridot::BufferContent::vertices::<
                 [peridot::ColoredVertex; 2],
-            >(GRID_MESH_LINE_COUNT)),
-            icosphere_vertices: static_bp.add(
-                peridot::BufferContent::vertices::<VertexWithNormals>(icosphere.vertices.len()),
-            ),
+            >(mesh::GRID_MESH_LINE_COUNT)),
+            icosphere_vertices: static_bp.add(peridot::BufferContent::vertices::<
+                mesh::VertexWithNormals,
+            >(icosphere.vertices.len())),
             icosphere_indices: static_bp.add(peridot::BufferContent::indices::<u16>(
                 icosphere.indices.len(),
             )),
@@ -833,7 +476,7 @@ impl Memory {
             let target_offset = self.mem.mut_buffer_placement + self.mutable_offsets.grid_mvp;
 
             tfb.add_copying_buffer(
-                self.dynamic_stg.buffer.with_dev_offset(o),
+                self.dynamic_stg.buffer().with_dev_offset(o),
                 self.mem.buffer.0.with_dev_offset(target_offset),
                 std::mem::size_of::<peridot::math::Matrix4F32>() as _,
             );
@@ -849,7 +492,7 @@ impl Memory {
             let r = self.object_transform_range();
 
             tfb.add_copying_buffer(
-                self.dynamic_stg.buffer.with_dev_offset(o),
+                self.dynamic_stg.buffer().with_dev_offset(o),
                 self.mem.buffer.0.with_dev_offset(r.start),
                 std::mem::size_of::<ObjectTransform>() as _,
             );
@@ -865,7 +508,7 @@ impl Memory {
             let r = self.camera_info_range();
 
             tfb.add_copying_buffer(
-                self.dynamic_stg.buffer.with_dev_offset(o),
+                self.dynamic_stg.buffer().with_dev_offset(o),
                 self.mem.buffer.0.with_dev_offset(r.start),
                 std::mem::size_of::<RasterizationCameraInfo>() as _,
             );
@@ -881,7 +524,7 @@ impl Memory {
             let r = self.directional_light_info_range();
 
             tfb.add_copying_buffer(
-                self.dynamic_stg.buffer.with_dev_offset(o),
+                self.dynamic_stg.buffer().with_dev_offset(o),
                 self.mem.buffer.0.with_dev_offset(r.start),
                 std::mem::size_of::<RasterizationDirectionalLightInfo>() as _,
             );
@@ -897,7 +540,7 @@ impl Memory {
             let r = self.material_range();
 
             tfb.add_copying_buffer(
-                self.dynamic_stg.buffer.with_dev_offset(o),
+                self.dynamic_stg.buffer().with_dev_offset(o),
                 self.mem.buffer.0.with_dev_offset(r.start),
                 std::mem::size_of::<MaterialInfo>() as _,
             );
@@ -1198,7 +841,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             screen_res.grid_render_pipeline.bind(&mut r);
             r.bind_graphics_descriptor_sets(0, &[const_res.grid_transform_desc()], &[]);
             r.bind_vertex_buffers(0, &[(&mem.mem.buffer.0, mem.static_offsets.grid as _)]);
-            r.draw(GRID_MESH_LINE_COUNT as _, 1, 0, 0);
+            r.draw(mesh::GRID_MESH_LINE_COUNT as _, 1, 0, 0);
             screen_res.pbr_pipeline.bind(&mut r);
             r.bind_graphics_descriptor_sets(
                 0,
