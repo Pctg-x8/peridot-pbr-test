@@ -153,8 +153,11 @@ impl DynamicStagingBuffer {
     /// returns placement of the value
     pub fn push<T>(&mut self, e: &peridot::Graphics, value: T) -> u64 {
         if self.top + std::mem::size_of::<T>() as u64 > self.cap {
-            self.resize(e, self.cap * 2)
-                .expect("Failed to resize dynamic staging buffer");
+            self.resize(
+                e,
+                (self.cap * 2).max(self.top + std::mem::size_of::<T>() as u64),
+            )
+            .expect("Failed to resize dynamic staging buffer");
         }
 
         let p = self.mapped();
@@ -162,6 +165,25 @@ impl DynamicStagingBuffer {
         self.top = placement + std::mem::size_of::<T>() as u64;
         unsafe {
             std::ptr::write(p.as_ptr().add(placement as _) as *mut T, value);
+        }
+
+        placement
+    }
+
+    /// returns first placement of the value
+    pub fn push_multiple_values<T: Clone>(&mut self, e: &peridot::Graphics, values: &[T]) -> u64 {
+        let size = std::mem::size_of::<T>() * values.len();
+        if self.top + size as u64 > self.cap {
+            self.resize(e, (self.cap * 2).max(self.top + size as u64))
+                .expect("Failed to resize dynamic staging buffer");
+        }
+
+        let p = self.mapped();
+        let placement = self.top;
+        self.top = placement + size as u64;
+        unsafe {
+            std::slice::from_raw_parts_mut(p.as_ptr().add(placement as _) as *mut T, values.len())
+                .clone_from_slice(values);
         }
 
         placement

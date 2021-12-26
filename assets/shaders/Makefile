@@ -1,5 +1,5 @@
 
-TARGETS = $(patsubst %.csh,%.pvp,$(wildcard *.csh))
+TARGETS = $(patsubst %.csh,%.pvp,$(wildcard **/*.csh))
 
 .SUFFIXES: .pvp .csh
 .PHONY: all

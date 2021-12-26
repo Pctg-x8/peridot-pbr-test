@@ -5,7 +5,12 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+use-freetype = ["peridot-vg/use-freetype"]
+
 [dependencies]
 peridot = { path = "../peridot" }
 bedrock = { git = "https://github.com/Pctg-x8/bedrock", branch = "peridot" }
 peridot-vertex-processing-pack = { path = "../peridot/vertex-processing-pack" }
+peridot-vg = { path = "../peridot/vg" }
+euclid = "0.19"
