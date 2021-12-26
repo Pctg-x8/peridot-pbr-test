@@ -491,6 +491,7 @@ impl ScreenResources {
             passOp: br::StencilOp::Replace as _,
         };
         pb.render_pass(&const_res.render_pass, 0);
+        pb.depth_write_enable(false);
         pb.stencil_test_enable(true);
         pb.stencil_control_front(stencil_simple_write.clone());
         pb.stencil_control_back(stencil_simple_write);
