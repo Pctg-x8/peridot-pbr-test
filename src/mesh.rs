@@ -207,6 +207,11 @@ impl UnitIcosphere {
 pub const UI_FILL_RECT_COUNT: usize = 4 * 4;
 pub const UI_FILL_RECT_INDEX_COUNT: usize = 6 * 4;
 pub const UI_FILL_RECT_BORDER_INDEX_COUNT: usize = 2 * 4;
+pub const UI_FILL_RECT_BORDER_INDICES: &'static [u16; UI_FILL_RECT_BORDER_INDEX_COUNT] =
+    &[1, 3, 5, 7, 9, 11, 13, 15];
+pub const UI_FILL_RECT_INDICES: &'static [u16; UI_FILL_RECT_INDEX_COUNT] = &[
+    0, 1, 2, 1, 2, 3, 4, 5, 6, 5, 6, 7, 8, 9, 10, 9, 10, 11, 12, 13, 14, 13, 14, 15,
+];
 
 pub fn build_ui_fill_rects(
     roughness_value: f32,

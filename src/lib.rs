@@ -577,18 +577,16 @@ impl peridot::FixedBufferInitializer for StaticBufferInitializer<'_> {
                     .stage_data_into(m, self.offsets.ui_mask.clone()),
             );
 
-            m.slice_mut::<u16>(
+            m.slice_mut(
                 self.offsets.ui_border_line_indices as _,
                 mesh::UI_FILL_RECT_BORDER_INDEX_COUNT,
             )
-            .copy_from_slice(&[1, 3, 5, 7, 9, 11, 13, 15]);
-            m.slice_mut::<u16>(
+            .copy_from_slice(mesh::UI_FILL_RECT_BORDER_INDICES);
+            m.slice_mut(
                 self.offsets.ui_fill_rect_indices as _,
                 mesh::UI_FILL_RECT_INDEX_COUNT,
             )
-            .copy_from_slice(&[
-                0, 1, 2, 1, 2, 3, 4, 5, 6, 5, 6, 7, 8, 9, 10, 9, 10, 11, 12, 13, 14, 13, 14, 15,
-            ]);
+            .copy_from_slice(mesh::UI_FILL_RECT_INDICES);
         }
     }
 
