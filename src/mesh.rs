@@ -1,8 +1,3 @@
-use crate::{
-    UI_ANISOTROPIC_TOP, UI_LEFT_MARGIN, UI_METALLIC_TOP, UI_REFLECTANCE_TOP, UI_ROUGHNESS_TOP,
-    UI_SLIDER_HEIGHT, UI_SLIDER_LABEL_HEIGHT, UI_SLIDER_WIDTH,
-};
-
 const GRID_SIZE: usize = 10;
 const GRID_AXIS_LENGTH: f32 = 100.0;
 const fn colored_line_mesh(
@@ -212,69 +207,3 @@ pub const UI_FILL_RECT_BORDER_INDICES: &'static [u16; UI_FILL_RECT_BORDER_INDEX_
 pub const UI_FILL_RECT_INDICES: &'static [u16; UI_FILL_RECT_INDEX_COUNT] = &[
     0, 1, 2, 1, 2, 3, 4, 5, 6, 5, 6, 7, 8, 9, 10, 9, 10, 11, 12, 13, 14, 13, 14, 15,
 ];
-
-pub fn build_ui_fill_rects(
-    roughness_value: f32,
-    anisotropic_value: f32,
-    metallic_value: f32,
-    reflectance_value: f32,
-) -> [peridot::math::Vector2F32; UI_FILL_RECT_COUNT] {
-    [
-        // roughness
-        peridot::math::Vector2(UI_LEFT_MARGIN, UI_ROUGHNESS_TOP + UI_SLIDER_LABEL_HEIGHT),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + roughness_value * UI_SLIDER_WIDTH,
-            UI_ROUGHNESS_TOP + UI_SLIDER_LABEL_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN,
-            UI_ROUGHNESS_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + roughness_value * UI_SLIDER_WIDTH,
-            UI_ROUGHNESS_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-        // anisotropic
-        peridot::math::Vector2(UI_LEFT_MARGIN, UI_ANISOTROPIC_TOP + UI_SLIDER_LABEL_HEIGHT),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + anisotropic_value * UI_SLIDER_WIDTH,
-            UI_ANISOTROPIC_TOP + UI_SLIDER_LABEL_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN,
-            UI_ANISOTROPIC_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + anisotropic_value * UI_SLIDER_WIDTH,
-            UI_ANISOTROPIC_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-        // metallic
-        peridot::math::Vector2(UI_LEFT_MARGIN, UI_METALLIC_TOP + UI_SLIDER_LABEL_HEIGHT),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + metallic_value * UI_SLIDER_WIDTH,
-            UI_METALLIC_TOP + UI_SLIDER_LABEL_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN,
-            UI_METALLIC_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + metallic_value * UI_SLIDER_WIDTH,
-            UI_METALLIC_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-        // reflectance
-        peridot::math::Vector2(UI_LEFT_MARGIN, UI_REFLECTANCE_TOP + UI_SLIDER_LABEL_HEIGHT),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + reflectance_value * UI_SLIDER_WIDTH,
-            UI_REFLECTANCE_TOP + UI_SLIDER_LABEL_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN,
-            UI_REFLECTANCE_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-        peridot::math::Vector2(
-            UI_LEFT_MARGIN + reflectance_value * UI_SLIDER_WIDTH,
-            UI_REFLECTANCE_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        ),
-    ]
-}

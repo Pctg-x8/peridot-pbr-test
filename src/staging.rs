@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use bedrock as br;
 use br::{MemoryBound, VkHandle};
+use peridot::mthelper::DynamicMutabilityProvider;
 
 pub struct DynamicStagingBuffer {
     buffer: peridot::Buffer,
@@ -25,7 +28,7 @@ impl DynamicStagingBuffer {
             })
             .expect("no matching memory for staging buffer");
         let memory = br::DeviceMemory::allocate(e, mreq.size as _, mtype.index())?;
-        let buffer = peridot::Buffer::bound(buffer, &std::rc::Rc::new(memory), 0)?;
+        let buffer = peridot::Buffer::bound(buffer, &Arc::new(memory.into()), 0)?;
 
         Ok(Self {
             buffer,
@@ -48,7 +51,8 @@ impl DynamicStagingBuffer {
         match self.mapped {
             Some(p) => p,
             None => {
-                let mapped = self.buffer.map(0..self.cap).expect("Failed to map memory");
+                let mut mm = self.buffer.memory().borrow_mut();
+                let mapped = mm.map(0..self.cap as _).expect("Failed to map memory");
                 let p =
                     unsafe { std::ptr::NonNull::new_unchecked(mapped.get_mut::<u8>(0) as *mut _) };
                 self.mapped = Some(p);
@@ -62,7 +66,7 @@ impl DynamicStagingBuffer {
             if self.require_explicit_flushing {
                 unsafe {
                     e.flush_mapped_memory_ranges(&[br::vk::VkMappedMemoryRange {
-                        memory: self.buffer.memory().native_ptr(),
+                        memory: self.buffer.memory().borrow().native_ptr(),
                         offset: 0,
                         size: self.cap,
                         ..Default::default()
@@ -72,28 +76,32 @@ impl DynamicStagingBuffer {
             }
 
             unsafe {
-                self.buffer.unmap();
+                self.buffer.memory().borrow_mut().unmap();
             }
         }
     }
 
-    fn resize(&mut self, e: &peridot::Graphics, new_size: u64) -> br::Result<()> {
+    fn resize(&mut self, e: &mut peridot::Graphics, new_size: u64) -> br::Result<()> {
         self.end_mapped(e);
 
         let buffer =
             br::BufferDesc::new(new_size as _, br::BufferUsage::TRANSFER_SRC.transfer_dest())
                 .create(e)?;
         let mreq = buffer.requirements();
-        let mtype = e
-            .memory_type_manager
-            .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::HOST_COHERENT)
-            .or_else(|| {
-                e.memory_type_manager
-                    .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::EMPTY)
-            })
-            .expect("no matching memory for staging buffer");
-        let memory = br::DeviceMemory::allocate(e, mreq.size as _, mtype.index())?;
-        let buffer = peridot::Buffer::bound(buffer, &std::rc::Rc::new(memory), 0)?;
+        let (mtindex, require_explicit_flushing) = {
+            let mt = e
+                .memory_type_manager
+                .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::HOST_COHERENT)
+                .or_else(|| {
+                    e.memory_type_manager
+                        .host_visible_index(mreq.memoryTypeBits, br::MemoryPropertyFlags::EMPTY)
+                })
+                .expect("no matching memory for staging buffer");
+
+            (mt.index(), !mt.is_host_coherent())
+        };
+        let memory = br::DeviceMemory::allocate(e, mreq.size as _, mtindex)?;
+        let buffer = peridot::Buffer::bound(buffer, &Arc::new(memory.into()), 0)?;
 
         e.submit_commands(|r| {
             let buffers_in = &[
@@ -145,13 +153,13 @@ impl DynamicStagingBuffer {
 
         self.cap = new_size;
         self.buffer = buffer;
-        self.require_explicit_flushing = !mtype.is_host_coherent();
+        self.require_explicit_flushing = require_explicit_flushing;
 
         Ok(())
     }
 
     /// returns placement of the value
-    pub fn push<T>(&mut self, e: &peridot::Graphics, value: T) -> u64 {
+    pub fn push<T>(&mut self, e: &mut peridot::Graphics, value: T) -> u64 {
         if self.top + std::mem::size_of::<T>() as u64 > self.cap {
             self.resize(
                 e,
@@ -171,7 +179,11 @@ impl DynamicStagingBuffer {
     }
 
     /// returns first placement of the value
-    pub fn push_multiple_values<T: Clone>(&mut self, e: &peridot::Graphics, values: &[T]) -> u64 {
+    pub fn push_multiple_values<T: Clone>(
+        &mut self,
+        e: &mut peridot::Graphics,
+        values: &[T],
+    ) -> u64 {
         let size = std::mem::size_of::<T>() * values.len();
         if self.top + size as u64 > self.cap {
             self.resize(e, (self.cap * 2).max(self.top + size as u64))
@@ -184,6 +196,32 @@ impl DynamicStagingBuffer {
         unsafe {
             std::slice::from_raw_parts_mut(p.as_ptr().add(placement as _) as *mut T, values.len())
                 .clone_from_slice(values);
+        }
+
+        placement
+    }
+
+    /// returns first placement of the value
+    pub fn construct_multiple_values_inplace<T>(
+        &mut self,
+        e: &mut peridot::Graphics,
+        length: usize,
+        mut ctor: impl FnMut(&mut [T]),
+    ) -> u64 {
+        let size = std::mem::size_of::<T>() * length;
+        if self.top + size as u64 > self.cap {
+            self.resize(e, (self.cap * 2).max(self.top + size as u64))
+                .expect("Failed to resize dynamic staging buffer");
+        }
+
+        let p = self.mapped();
+        let placement = self.top;
+        self.top = placement + size as u64;
+        unsafe {
+            ctor(std::slice::from_raw_parts_mut(
+                p.as_ptr().add(placement as _) as *mut T,
+                length,
+            ));
         }
 
         placement

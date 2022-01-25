@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bedrock as br;
 use br::{MemoryBound, VkHandle};
@@ -35,25 +36,97 @@ pub struct MaterialInfo {
     reflectance: f32,
 }
 
+pub struct Descriptors {
+    _pool: br::DescriptorPool,
+    descriptors: Vec<br::DescriptorSet>,
+}
+impl Descriptors {
+    pub fn new(
+        e: &peridot::Engine<impl peridot::NativeLinker>,
+        const_res: &ConstResources,
+    ) -> Self {
+        let mut dp = br::DescriptorPool::new(
+            e.graphics_device(),
+            8,
+            &[
+                br::DescriptorPoolSize(br::DescriptorType::UniformBuffer, 6),
+                br::DescriptorPoolSize(br::DescriptorType::UniformTexelBuffer, 3),
+            ],
+            false,
+        )
+        .expect("Failed to create descriptor pool");
+        let descriptors = dp
+            .alloc(&[
+                &const_res.dsl_ub1,
+                &const_res.dsl_ub1,
+                &const_res.dsl_ub2_f,
+                &const_res.dsl_ub1_f,
+                &const_res.dsl_utb1,
+                &const_res.dsl_utb1,
+                &const_res.dsl_utb1,
+                &const_res.dsl_ub1,
+            ])
+            .expect("Failed to allocate descriptors");
+
+        Self {
+            _pool: dp,
+            descriptors,
+        }
+    }
+
+    pub fn grid_transform(&self) -> br::DescriptorSet {
+        self.descriptors[0]
+    }
+
+    pub fn object_transform(&self) -> br::DescriptorSet {
+        self.descriptors[1]
+    }
+
+    pub fn rasterization_scene_info(&self) -> br::DescriptorSet {
+        self.descriptors[2]
+    }
+
+    pub fn material_info(&self) -> br::DescriptorSet {
+        self.descriptors[3]
+    }
+
+    pub fn ui_transform_buffer(&self) -> br::DescriptorSet {
+        self.descriptors[4]
+    }
+
+    pub fn ui_mask_transform_buffer(&self) -> br::DescriptorSet {
+        self.descriptors[5]
+    }
+
+    pub fn ui_dynamic_transform_buffer(&self) -> br::DescriptorSet {
+        self.descriptors[6]
+    }
+
+    pub fn ui_fill_rect_transform(&self) -> br::DescriptorSet {
+        self.descriptors[7]
+    }
+}
+
 pub struct ConstResources {
     render_pass: br::RenderPass,
     dsl_ub1: br::DescriptorSetLayout,
     dsl_ub1_f: br::DescriptorSetLayout,
     dsl_ub2_f: br::DescriptorSetLayout,
     dsl_utb1: br::DescriptorSetLayout,
-    dp: br::DescriptorPool,
-    descriptors: Vec<br::vk::VkDescriptorSet>,
     unlit_colored_shader: PvpShaderModules<'static>,
-    unlit_colored_pipeline_layout: Rc<br::PipelineLayout>,
+    unlit_colored_pipeline_layout: Arc<br::PipelineLayout>,
     pbr_shader: PvpShaderModules<'static>,
-    pbr_pipeline_layout: Rc<br::PipelineLayout>,
+    pbr_pipeline_layout: Arc<br::PipelineLayout>,
     vg_interior_color_fixed_shader: PvpShaderModules<'static>,
     vg_curve_color_fixed_shader: PvpShaderModules<'static>,
-    vg_pipeline_layout: Rc<br::PipelineLayout>,
+    vg_pipeline_layout: Arc<br::PipelineLayout>,
     unlit_colored_ext_shader: PvpShaderModules<'static>,
-    unlit_colored_ext_pipeline: Rc<br::PipelineLayout>,
+    unlit_colored_ext_pipeline: Arc<br::PipelineLayout>,
 }
 impl ConstResources {
+    const RENDER_STENCIL_PREPASS: u32 = 0;
+    const RENDER_MAIN_PASS: u32 = 1;
+
     pub fn new(e: &peridot::Engine<impl peridot::NativeLinker>) -> Self {
         let main_attachment = br::AttachmentDescription::new(
             e.backbuffer_format(),
@@ -133,22 +206,6 @@ impl ConstResources {
             )],
         )
         .expect("Failed to create utb1 descriptor set layout");
-        let dp = br::DescriptorPool::new(
-            e.graphics_device(),
-            8,
-            &[
-                br::DescriptorPoolSize(br::DescriptorType::UniformBuffer, 6),
-                br::DescriptorPoolSize(br::DescriptorType::UniformTexelBuffer, 3),
-            ],
-            false,
-        )
-        .expect("Failed to create descriptor pool");
-        let descriptors = dp
-            .alloc(&[
-                &dsl_ub1, &dsl_ub1, &dsl_ub2_f, &dsl_ub1_f, &dsl_utb1, &dsl_utb1, &dsl_utb1,
-                &dsl_ub1,
-            ])
-            .expect("Failed to allocate descriptors");
 
         let unlit_colored_shader = PvpShaderModules::new(
             e.graphics_device(),
@@ -213,8 +270,6 @@ impl ConstResources {
             dsl_ub1_f,
             dsl_ub2_f,
             dsl_utb1,
-            dp,
-            descriptors,
             unlit_colored_shader,
             unlit_colored_pipeline_layout,
             pbr_shader,
@@ -225,38 +280,6 @@ impl ConstResources {
             unlit_colored_ext_shader,
             unlit_colored_ext_pipeline,
         }
-    }
-
-    pub fn grid_transform_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[0]
-    }
-
-    pub fn object_transform_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[1]
-    }
-
-    pub fn rasterization_scene_info_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[2]
-    }
-
-    pub fn material_info_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[3]
-    }
-
-    pub fn ui_transform_buffer_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[4]
-    }
-
-    pub fn ui_mask_transform_buffer_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[5]
-    }
-
-    pub fn ui_roughness_text_transform_buffer_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[6]
-    }
-
-    pub fn ui_fill_rect_transform_desc(&self) -> br::vk::VkDescriptorSet {
-        self.descriptors[7]
     }
 }
 
@@ -277,7 +300,7 @@ pub struct ScreenResources {
 }
 impl ScreenResources {
     pub fn new(
-        e: &peridot::Engine<impl peridot::NativeLinker>,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
         const_res: &ConstResources,
     ) -> Self {
         let bb0 = e.backbuffer(0).expect("no backbuffers?");
@@ -301,7 +324,7 @@ impl ScreenResources {
                 .index(),
         )
         .expect("Failed to allocate depth buffer memory");
-        let depth_texture = peridot::Image::bound(depth_image, &Rc::new(depth_mem), 0)
+        let depth_texture = peridot::Image::bound(depth_image, &Arc::new(depth_mem.into()), 0)
             .expect("Failed to bind depth buffer memory");
         let depth_texture_view = depth_texture
             .create_view(
@@ -742,7 +765,7 @@ impl Memory {
 
     pub fn apply_main_camera(
         &mut self,
-        e: &peridot::Graphics,
+        e: &mut peridot::Graphics,
         camera: &peridot::math::Camera,
         aspect: f32,
     ) {
@@ -759,33 +782,45 @@ impl Memory {
         ));
     }
 
-    pub fn set_camera_info(&mut self, e: &peridot::Graphics, info: RasterizationCameraInfo) {
+    pub fn set_camera_info(&mut self, e: &mut peridot::Graphics, info: RasterizationCameraInfo) {
         self.update_sets.camera_info_stg_offset = Some(self.dynamic_stg.push(e, info));
     }
 
     pub fn set_directional_light_info(
         &mut self,
-        e: &peridot::Graphics,
+        e: &mut peridot::Graphics,
         info: RasterizationDirectionalLightInfo,
     ) {
         self.update_sets.directional_light_info_stg_offset = Some(self.dynamic_stg.push(e, info));
     }
 
-    pub fn set_material(&mut self, e: &peridot::Graphics, info: MaterialInfo) {
+    pub fn set_material(&mut self, e: &mut peridot::Graphics, info: MaterialInfo) {
         self.update_sets.material_stg_offset = Some(self.dynamic_stg.push(e, info));
     }
 
     pub fn update_ui_fill_rect_vertices(
         &mut self,
-        e: &peridot::Graphics,
+        e: &mut peridot::Graphics,
         vertices: &[peridot::math::Vector2F32; mesh::UI_FILL_RECT_COUNT],
     ) {
         self.update_sets.ui_fill_rects = Some(self.dynamic_stg.push_multiple_values(e, vertices));
     }
 
+    pub fn construct_new_ui_fill_rect_vertices(
+        &mut self,
+        e: &mut peridot::Graphics,
+        ctor: impl FnMut(&mut [peridot::math::Vector2F32]),
+    ) {
+        self.update_sets.ui_fill_rects = Some(self.dynamic_stg.construct_multiple_values_inplace(
+            e,
+            mesh::UI_FILL_RECT_COUNT,
+            ctor,
+        ));
+    }
+
     pub fn set_ui_transform(
         &mut self,
-        e: &peridot::Graphics,
+        e: &mut peridot::Graphics,
         transform: peridot::math::Matrix4F32,
     ) {
         self.update_sets.ui_transform = Some(self.dynamic_stg.push(e, transform));
@@ -983,7 +1018,7 @@ impl UIRenderingBuffers {
                 .expect("no suitable memory for ui rendering meshes")
                 .index(),
         )?;
-        let buffer = peridot::Buffer::bound(buffer, &Rc::new(memory), 0)?;
+        let buffer = peridot::Buffer::bound(buffer, &Arc::new(memory.into()), 0)?;
         let transform_buffer_view = buffer.create_view(
             br::vk::VK_FORMAT_R32G32B32A32_SFLOAT,
             offsets.transforms_byterange(),
@@ -1000,7 +1035,7 @@ impl UIRenderingBuffers {
             })
             .expect("no suitable memory for staging");
         let memory = br::DeviceMemory::allocate(e, mreq.size as _, stg_mty.index())?;
-        let stg_buffer = peridot::Buffer::bound(stg_buffer, &Rc::new(memory), 0)?;
+        let mut stg_buffer = peridot::Buffer::bound(stg_buffer, &Arc::new(memory.into()), 0)?;
         let render_params = stg_buffer.guard_map(0..bp.total_size(), move |mem| {
             context.stage_data_into(mem, offsets)
         })?;
@@ -1075,42 +1110,6 @@ pub enum CapturingComponent {
     Metallic,
     Reflectance,
 }
-impl CapturingComponent {
-    fn from_point((px, py): (f32, f32)) -> Option<Self> {
-        const UI_ROUGHNESS_RECT: (std::ops::Range<f32>, std::ops::Range<f32>) = (
-            UI_LEFT_MARGIN..UI_LEFT_MARGIN + UI_SLIDER_WIDTH,
-            UI_ROUGHNESS_TOP + UI_SLIDER_LABEL_HEIGHT
-                ..UI_ROUGHNESS_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        );
-        const UI_ANISOTROPIC_RECT: (std::ops::Range<f32>, std::ops::Range<f32>) = (
-            UI_LEFT_MARGIN..UI_LEFT_MARGIN + UI_SLIDER_WIDTH,
-            UI_ANISOTROPIC_TOP + UI_SLIDER_LABEL_HEIGHT
-                ..UI_ANISOTROPIC_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        );
-        const UI_METALLIC_RECT: (std::ops::Range<f32>, std::ops::Range<f32>) = (
-            UI_LEFT_MARGIN..UI_LEFT_MARGIN + UI_SLIDER_WIDTH,
-            UI_METALLIC_TOP + UI_SLIDER_LABEL_HEIGHT
-                ..UI_METALLIC_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        );
-        const UI_REFLECTANCE_RECT: (std::ops::Range<f32>, std::ops::Range<f32>) = (
-            UI_LEFT_MARGIN..UI_LEFT_MARGIN + UI_SLIDER_WIDTH,
-            UI_REFLECTANCE_TOP + UI_SLIDER_LABEL_HEIGHT
-                ..UI_REFLECTANCE_TOP + UI_SLIDER_LABEL_HEIGHT + UI_SLIDER_HEIGHT,
-        );
-
-        if UI_ROUGHNESS_RECT.0.contains(&px) && UI_ROUGHNESS_RECT.1.contains(&py) {
-            Some(Self::Roughness)
-        } else if UI_ANISOTROPIC_RECT.0.contains(&px) && UI_ANISOTROPIC_RECT.1.contains(&py) {
-            Some(Self::Anisotropic)
-        } else if UI_METALLIC_RECT.0.contains(&px) && UI_METALLIC_RECT.1.contains(&py) {
-            Some(Self::Metallic)
-        } else if UI_REFLECTANCE_RECT.0.contains(&px) && UI_REFLECTANCE_RECT.1.contains(&py) {
-            Some(Self::Reflectance)
-        } else {
-            None
-        }
-    }
-}
 
 pub const UI_SLIDER_WIDTH: f32 = 204.0;
 pub const UI_SLIDER_HEIGHT: f32 = 32.0;
@@ -1124,18 +1123,290 @@ pub const UI_ANISOTROPIC_TOP: f32 = 108.0;
 pub const UI_METALLIC_TOP: f32 = 168.0;
 pub const UI_REFLECTANCE_TOP: f32 = 228.0;
 
+trait UIRenderable {
+    #[allow(unused_variables)]
+    fn render(&self, context: &mut peridot_vg::Context) {}
+    #[allow(unused_variables)]
+    fn render_mask(&self, context: &mut peridot_vg::Context) {}
+    #[allow(unused_variables)]
+    fn render_dynamic(&self, context: &mut peridot_vg::Context) {}
+    #[allow(unused_variables)]
+    fn render_dynamic_mesh(&self, vertices: &mut [peridot::math::Vector2F32]) {}
+}
+
+struct UIStaticLabel {
+    position: peridot::math::Vector2F32,
+    text: String,
+    font: std::rc::Rc<peridot_vg::Font>,
+}
+impl UIStaticLabel {
+    pub fn new(
+        position: peridot::math::Vector2F32,
+        text: String,
+        font: std::rc::Rc<peridot_vg::Font>,
+    ) -> Self {
+        Self {
+            position,
+            text,
+            font,
+        }
+    }
+}
+impl UIRenderable for UIStaticLabel {
+    fn render(&self, context: &mut peridot_vg::Context) {
+        context.set_transform(euclid::Transform2D::create_translation(
+            self.position.0,
+            self.position.1,
+        ));
+        context
+            .text(&self.font, &self.text)
+            .expect("Text rendering failed");
+    }
+}
+
+struct UISlider {
+    position: peridot::math::Vector2F32,
+    size: peridot::math::Vector2F32,
+    label_font: std::rc::Rc<peridot_vg::Font>,
+    value: f32,
+    capture_id: CapturingComponent,
+    mesh_vertex_offset: usize,
+}
+impl UISlider {
+    const OUTLINE_THICKNESS: f32 = 2.0;
+
+    pub fn new(
+        position: peridot::math::Vector2F32,
+        size: peridot::math::Vector2F32,
+        label_font: std::rc::Rc<peridot_vg::Font>,
+        init_value: f32,
+        capture_id: CapturingComponent,
+        mesh_vertex_offset: usize,
+    ) -> Self {
+        Self {
+            position,
+            size,
+            label_font,
+            value: init_value,
+            capture_id,
+            mesh_vertex_offset,
+        }
+    }
+
+    pub fn try_capture_input(&self, p: peridot::math::Vector2F32) -> Option<CapturingComponent> {
+        if (self.position.0..=self.position.0 + self.size.0).contains(&p.0)
+            && (-self.position.1..=-self.position.1 + self.size.1).contains(&p.1)
+        {
+            Some(self.capture_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn update_capturing_input(&mut self, e: &peridot::Engine<impl peridot::NativeLinker>) {
+        if let Some((px, _)) = e.input().get_plane_position(0) {
+            let lx = px - self.position.0;
+            self.value = (lx / self.size.0).min(1.0).max(0.0);
+        }
+    }
+}
+
+impl UIRenderable for UISlider {
+    fn render(&self, context: &mut peridot_vg::Context) {
+        context.set_transform(euclid::Transform2D::create_translation(
+            self.position.0,
+            self.position.1,
+        ));
+
+        let mut f = context.begin_figure(peridot_vg::FillRule::EvenOdd);
+        // outer
+        f.move_to(peridot::math::Vector2(8.0, 0.0).into());
+        f.line_to(peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, 0.0).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(UI_SLIDER_WIDTH, 0.0).into(),
+            peridot::math::Vector2(UI_SLIDER_WIDTH, -8.0).into(),
+        );
+        f.line_to(peridot::math::Vector2(UI_SLIDER_WIDTH, -UI_SLIDER_HEIGHT + 8.0).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(UI_SLIDER_WIDTH, -UI_SLIDER_HEIGHT).into(),
+            peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, -UI_SLIDER_HEIGHT).into(),
+        );
+        f.line_to(peridot::math::Vector2(8.0, -UI_SLIDER_HEIGHT).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(0.0, -UI_SLIDER_HEIGHT).into(),
+            peridot::math::Vector2(0.0, -UI_SLIDER_HEIGHT + 8.0).into(),
+        );
+        f.line_to(peridot::math::Vector2(0.0, -8.0).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(0.0, 0.0).into(),
+            peridot::math::Vector2(8.0, 0.0).into(),
+        );
+        // inner
+        f.move_to(peridot::math::Vector2(8.0, -Self::OUTLINE_THICKNESS).into());
+        f.line_to(peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, -Self::OUTLINE_THICKNESS).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS,
+                -Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+            peridot::math::Vector2(UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS, -8.0).into(),
+        );
+        f.line_to(
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS,
+                -UI_SLIDER_HEIGHT + 8.0,
+            )
+            .into(),
+        );
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS,
+                -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - 8.0,
+                -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+        );
+        f.line_to(peridot::math::Vector2(8.0, -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(
+                Self::OUTLINE_THICKNESS,
+                -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+            peridot::math::Vector2(Self::OUTLINE_THICKNESS, -UI_SLIDER_HEIGHT + 8.0).into(),
+        );
+        f.line_to(peridot::math::Vector2(Self::OUTLINE_THICKNESS, -8.0).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(Self::OUTLINE_THICKNESS, -Self::OUTLINE_THICKNESS).into(),
+            peridot::math::Vector2(8.0, -Self::OUTLINE_THICKNESS).into(),
+        );
+        f.end();
+    }
+
+    fn render_mask(&self, context: &mut peridot_vg::Context) {
+        context.set_transform(euclid::Transform2D::create_translation(
+            self.position.0,
+            self.position.1,
+        ));
+
+        let mut f = context.begin_figure(peridot_vg::FillRule::Winding);
+        // mask
+        f.move_to(peridot::math::Vector2(8.0, -Self::OUTLINE_THICKNESS).into());
+        f.line_to(peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, -Self::OUTLINE_THICKNESS).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS,
+                -Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+            peridot::math::Vector2(UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS, -8.0).into(),
+        );
+        f.line_to(
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS,
+                -UI_SLIDER_HEIGHT + 8.0,
+            )
+            .into(),
+        );
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - Self::OUTLINE_THICKNESS,
+                -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+            peridot::math::Vector2(
+                UI_SLIDER_WIDTH - 8.0,
+                -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+        );
+        f.line_to(peridot::math::Vector2(8.0, -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(
+                Self::OUTLINE_THICKNESS,
+                -UI_SLIDER_HEIGHT + Self::OUTLINE_THICKNESS,
+            )
+            .into(),
+            peridot::math::Vector2(Self::OUTLINE_THICKNESS, -UI_SLIDER_HEIGHT + 8.0).into(),
+        );
+        f.line_to(peridot::math::Vector2(Self::OUTLINE_THICKNESS, -8.0).into());
+        f.quadratic_bezier_to(
+            peridot::math::Vector2(Self::OUTLINE_THICKNESS, -Self::OUTLINE_THICKNESS).into(),
+            peridot::math::Vector2(8.0, -Self::OUTLINE_THICKNESS).into(),
+        );
+        f.end();
+    }
+
+    fn render_dynamic(&self, context: &mut peridot_vg::Context) {
+        context.set_transform(euclid::Transform2D::create_translation(
+            self.position.0 + 16.0,
+            self.position.1 - UI_SLIDER_VALUE_LABEL_TOP_OFFSET,
+        ));
+        context
+            .text(&self.label_font, &format!("{:.1}", self.value))
+            .expect("Text rendering failed");
+    }
+
+    fn render_dynamic_mesh(&self, vertices: &mut [peridot::math::Vector2F32]) {
+        vertices[self.mesh_vertex_offset + 0] =
+            peridot::math::Vector2(self.position.0, -self.position.1);
+        vertices[self.mesh_vertex_offset + 1] =
+            peridot::math::Vector2(self.position.0 + self.size.0 * self.value, -self.position.1);
+        vertices[self.mesh_vertex_offset + 2] =
+            peridot::math::Vector2(self.position.0, -self.position.1 + self.size.1);
+        vertices[self.mesh_vertex_offset + 3] = peridot::math::Vector2(
+            self.position.0 + self.size.0 * self.value,
+            -self.position.1 + self.size.1,
+        );
+    }
+}
+
+pub struct RenderBundle {
+    pool: br::CommandPool,
+    buffers: Vec<br::CommandBuffer>,
+}
+impl RenderBundle {
+    pub fn new(g: &peridot::Graphics, count: u32) -> br::Result<Self> {
+        let mut pool = br::CommandPool::new(&g, g.graphics_queue_family_index(), false, false)?;
+
+        Ok(Self {
+            buffers: pool.alloc(count, false)?,
+            pool,
+        })
+    }
+
+    pub fn reset(&mut self) -> br::Result<()> {
+        self.pool.reset(false)
+    }
+
+    pub fn synchronized(&mut self, index: usize) -> br::SynchronizedCommandBuffer {
+        unsafe { self.buffers[index].synchronize_with(&mut self.pool) }
+    }
+}
+
 pub struct Game<NL: peridot::NativeLinker> {
     const_res: ConstResources,
+    descriptors: Descriptors,
     mem: Memory,
     screen_res: ScreenResources,
-    ui_roughness_text_rendering_buffers: UIRenderingBuffers,
+    ui_dynamic_buffers: UIRenderingBuffers,
     command_buffers: peridot::CommandBundle,
     update_commands: peridot::CommandBundle,
+    render_bundles: Vec<RenderBundle>,
     main_camera: peridot::math::Camera,
     aspect: f32,
     dirty_main_camera: bool,
     material_data: DirtyTracker<MaterialInfo>,
     capturing_component: Option<CapturingComponent>,
+    ui_roughness_slider: UISlider,
+    ui_anisotropic_slider: UISlider,
+    ui_metallic_slider: UISlider,
+    ui_reflectance_slider: UISlider,
     plane_touch_edge: EdgeTrigger<bool>,
     ph: std::marker::PhantomData<*const NL>,
 }
@@ -1144,10 +1415,21 @@ impl<NL: peridot::NativeLinker> Game<NL> {
     pub const VERSION: (u32, u32, u32) = (0, 1, 0);
 }
 impl<NL: peridot::NativeLinker> peridot::FeatureRequests for Game<NL> {}
-impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
+impl<NL: peridot::NativeLinker + Sync> peridot::EngineEvents<NL> for Game<NL>
+where
+    NL::Presenter: Sync,
+{
     fn init(e: &mut peridot::Engine<NL>) -> Self {
         e.input_mut()
             .map(peridot::NativeButtonInput::Mouse(0), ID_PLANE_PRESS);
+
+        let material_data = DirtyTracker::new(MaterialInfo {
+            base_color: peridot::math::Vector4(1.0, 0.0, 0.0, 1.0),
+            roughness: 0.4,
+            anisotropic: 0.0,
+            metallic: 0.0,
+            reflectance: 0.5,
+        });
 
         let bb0 = e.backbuffer(0).expect("no backbuffers?");
         let render_area = AsRef::<br::vk::VkExtent2D>::as_ref(bb0.size())
@@ -1157,159 +1439,94 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
 
         let mut ui = peridot_vg::Context::new(e.rendering_precision());
         let mut ui_control_mask = peridot_vg::Context::new(e.rendering_precision());
-        let mut ui_roughness_label = peridot_vg::Context::new(e.rendering_precision());
-        let font = peridot_vg::FontProvider::new()
-            .expect("Failed to create FontProvider")
-            .best_match("Yu Gothic UI", &peridot_vg::FontProperties::default(), 18.0)
-            .expect("Failed to find best match font");
-        let font_sm = peridot_vg::FontProvider::new()
-            .expect("Failed to create FontProvider")
-            .best_match("Yu Gothic UI", &peridot_vg::FontProperties::default(), 14.0)
-            .expect("Failed to find best match font");
-        ui.set_transform(euclid::Transform2D::create_translation(8.0, -8.0));
-        ui.text(&font, "Peridot PBR Test Controls")
-            .expect("Text Rendering failed");
+        let mut ui_dynamic_texts = peridot_vg::Context::new(e.rendering_precision());
+        let font = Rc::new(
+            peridot_vg::FontProvider::new()
+                .expect("Failed to create FontProvider")
+                .best_match("Yu Gothic UI", &peridot_vg::FontProperties::default(), 18.0)
+                .expect("Failed to find best match font"),
+        );
+        let font_sm = Rc::new(
+            peridot_vg::FontProvider::new()
+                .expect("Failed to create FontProvider")
+                .best_match("Yu Gothic UI", &peridot_vg::FontProperties::default(), 14.0)
+                .expect("Failed to find best match font"),
+        );
 
-        let mut render_slider_frame = |offset: peridot::math::Vector2F32, name: &str| {
-            ui.set_transform(euclid::Transform2D::create_translation(offset.0, offset.1));
-            ui.text(&font_sm, name)
-                .expect("Slider Label rendering failed");
-            let t = euclid::Transform2D::create_translation(
-                offset.0,
-                offset.1 - UI_SLIDER_LABEL_HEIGHT,
-            );
-            ui.set_transform(t.clone());
-            ui_control_mask.set_transform(t);
-
-            let mut ctx = ui.begin_figure(peridot_vg::FillRule::EvenOdd);
-            let mut ctx_mask = ui_control_mask.begin_figure(peridot_vg::FillRule::Winding);
-            // outer
-            ctx.move_to(peridot::math::Vector2(8.0, 0.0).into());
-            ctx.line_to(peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, 0.0).into());
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(UI_SLIDER_WIDTH, 0.0).into(),
-                peridot::math::Vector2(UI_SLIDER_WIDTH, -8.0).into(),
-            );
-            ctx.line_to(peridot::math::Vector2(UI_SLIDER_WIDTH, -UI_SLIDER_HEIGHT + 8.0).into());
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(UI_SLIDER_WIDTH, -UI_SLIDER_HEIGHT).into(),
-                peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, -UI_SLIDER_HEIGHT).into(),
-            );
-            ctx.line_to(peridot::math::Vector2(8.0, -UI_SLIDER_HEIGHT).into());
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(0.0, -UI_SLIDER_HEIGHT).into(),
-                peridot::math::Vector2(0.0, -UI_SLIDER_HEIGHT + 8.0).into(),
-            );
-            ctx.line_to(peridot::math::Vector2(0.0, -8.0).into());
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(0.0, 0.0).into(),
-                peridot::math::Vector2(8.0, 0.0).into(),
-            );
-            // inner
-            const OUTLINE_THICKNESS: f32 = 2.0;
-            ctx.move_to(peridot::math::Vector2(8.0, -OUTLINE_THICKNESS).into());
-            ctx.line_to(peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, -OUTLINE_THICKNESS).into());
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(UI_SLIDER_WIDTH - OUTLINE_THICKNESS, -OUTLINE_THICKNESS)
-                    .into(),
-                peridot::math::Vector2(UI_SLIDER_WIDTH - OUTLINE_THICKNESS, -8.0).into(),
-            );
-            ctx.line_to(
-                peridot::math::Vector2(
-                    UI_SLIDER_WIDTH - OUTLINE_THICKNESS,
-                    -UI_SLIDER_HEIGHT + 8.0,
-                )
-                .into(),
-            );
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(
-                    UI_SLIDER_WIDTH - OUTLINE_THICKNESS,
-                    -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS,
-                )
-                .into(),
-                peridot::math::Vector2(
-                    UI_SLIDER_WIDTH - 8.0,
-                    -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS,
-                )
-                .into(),
-            );
-            ctx.line_to(peridot::math::Vector2(8.0, -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS).into());
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(OUTLINE_THICKNESS, -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS)
-                    .into(),
-                peridot::math::Vector2(OUTLINE_THICKNESS, -UI_SLIDER_HEIGHT + 8.0).into(),
-            );
-            ctx.line_to(peridot::math::Vector2(OUTLINE_THICKNESS, -8.0).into());
-            ctx.quadratic_bezier_to(
-                peridot::math::Vector2(OUTLINE_THICKNESS, -OUTLINE_THICKNESS).into(),
-                peridot::math::Vector2(8.0, -OUTLINE_THICKNESS).into(),
-            );
-            // mask
-            ctx_mask.move_to(peridot::math::Vector2(8.0, -OUTLINE_THICKNESS).into());
-            ctx_mask
-                .line_to(peridot::math::Vector2(UI_SLIDER_WIDTH - 8.0, -OUTLINE_THICKNESS).into());
-            ctx_mask.quadratic_bezier_to(
-                peridot::math::Vector2(UI_SLIDER_WIDTH - OUTLINE_THICKNESS, -OUTLINE_THICKNESS)
-                    .into(),
-                peridot::math::Vector2(UI_SLIDER_WIDTH - OUTLINE_THICKNESS, -8.0).into(),
-            );
-            ctx_mask.line_to(
-                peridot::math::Vector2(
-                    UI_SLIDER_WIDTH - OUTLINE_THICKNESS,
-                    -UI_SLIDER_HEIGHT + 8.0,
-                )
-                .into(),
-            );
-            ctx_mask.quadratic_bezier_to(
-                peridot::math::Vector2(
-                    UI_SLIDER_WIDTH - OUTLINE_THICKNESS,
-                    -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS,
-                )
-                .into(),
-                peridot::math::Vector2(
-                    UI_SLIDER_WIDTH - 8.0,
-                    -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS,
-                )
-                .into(),
-            );
-            ctx_mask
-                .line_to(peridot::math::Vector2(8.0, -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS).into());
-            ctx_mask.quadratic_bezier_to(
-                peridot::math::Vector2(OUTLINE_THICKNESS, -UI_SLIDER_HEIGHT + OUTLINE_THICKNESS)
-                    .into(),
-                peridot::math::Vector2(OUTLINE_THICKNESS, -UI_SLIDER_HEIGHT + 8.0).into(),
-            );
-            ctx_mask.line_to(peridot::math::Vector2(OUTLINE_THICKNESS, -8.0).into());
-            ctx_mask.quadratic_bezier_to(
-                peridot::math::Vector2(OUTLINE_THICKNESS, -OUTLINE_THICKNESS).into(),
-                peridot::math::Vector2(8.0, -OUTLINE_THICKNESS).into(),
-            );
-            ctx.end();
-            ctx_mask.end();
-        };
-        render_slider_frame(
+        let ui_heading_label = UIStaticLabel::new(
+            peridot::math::Vector2(8.0, -8.0),
+            String::from("Peridot PBR Test Controls"),
+            font.clone(),
+        );
+        let ui_roughness_label = UIStaticLabel::new(
             peridot::math::Vector2(UI_LEFT_MARGIN, -UI_ROUGHNESS_TOP),
-            "roughness",
+            String::from("roughness"),
+            font_sm.clone(),
         );
-        render_slider_frame(
+        let ui_roughness_slider = UISlider::new(
+            peridot::math::Vector2(UI_LEFT_MARGIN, -UI_ROUGHNESS_TOP - UI_SLIDER_LABEL_HEIGHT),
+            peridot::math::Vector2(UI_SLIDER_WIDTH, UI_SLIDER_HEIGHT),
+            font_sm.clone(),
+            material_data.get().roughness,
+            CapturingComponent::Roughness,
+            0,
+        );
+        let ui_anisotropic_label = UIStaticLabel::new(
             peridot::math::Vector2(UI_LEFT_MARGIN, -UI_ANISOTROPIC_TOP),
-            "anisotropic",
+            String::from("anisotropic"),
+            font_sm.clone(),
         );
-        render_slider_frame(
+        let ui_anisotropic_slider = UISlider::new(
+            peridot::math::Vector2(UI_LEFT_MARGIN, -UI_ANISOTROPIC_TOP - UI_SLIDER_LABEL_HEIGHT),
+            peridot::math::Vector2(UI_SLIDER_WIDTH, UI_SLIDER_HEIGHT),
+            font_sm.clone(),
+            material_data.get().anisotropic,
+            CapturingComponent::Anisotropic,
+            4,
+        );
+        let ui_metallic_label = UIStaticLabel::new(
             peridot::math::Vector2(UI_LEFT_MARGIN, -UI_METALLIC_TOP),
-            "metallic",
+            String::from("metallic"),
+            font_sm.clone(),
         );
-        render_slider_frame(
+        let ui_metallic_slider = UISlider::new(
+            peridot::math::Vector2(UI_LEFT_MARGIN, -UI_METALLIC_TOP - UI_SLIDER_LABEL_HEIGHT),
+            peridot::math::Vector2(UI_SLIDER_WIDTH, UI_SLIDER_HEIGHT),
+            font_sm.clone(),
+            material_data.get().metallic,
+            CapturingComponent::Metallic,
+            8,
+        );
+        let ui_reflectance_label = UIStaticLabel::new(
             peridot::math::Vector2(UI_LEFT_MARGIN, -UI_REFLECTANCE_TOP),
-            "reflectance",
+            String::from("reflectance"),
+            font_sm.clone(),
         );
-        ui_roughness_label.set_transform(euclid::Transform2D::create_translation(
-            UI_SLIDER_VALUE_LABEL_LEFT,
-            -UI_ROUGHNESS_TOP - UI_SLIDER_LABEL_HEIGHT - UI_SLIDER_VALUE_LABEL_TOP_OFFSET,
-        ));
-        ui_roughness_label
-            .text(&font_sm, "0.4")
-            .expect("Text rendering failed");
+        let ui_reflectance_slider = UISlider::new(
+            peridot::math::Vector2(UI_LEFT_MARGIN, -UI_REFLECTANCE_TOP - UI_SLIDER_LABEL_HEIGHT),
+            peridot::math::Vector2(UI_SLIDER_WIDTH, UI_SLIDER_HEIGHT),
+            font_sm.clone(),
+            material_data.get().reflectance,
+            CapturingComponent::Reflectance,
+            12,
+        );
+
+        let renderables = [
+            &ui_heading_label as &dyn UIRenderable,
+            &ui_roughness_label,
+            &ui_roughness_slider,
+            &ui_anisotropic_label,
+            &ui_anisotropic_slider,
+            &ui_metallic_label,
+            &ui_metallic_slider,
+            &ui_reflectance_label,
+            &ui_reflectance_slider,
+        ];
+        for r in &renderables {
+            r.render(&mut ui);
+            r.render_mask(&mut ui_control_mask);
+            r.render_dynamic(&mut ui_dynamic_texts);
+        }
 
         let const_res = ConstResources::new(e);
         let mut tfb = peridot::TransferBatch::new();
@@ -1323,9 +1540,9 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             rotation: peridot::math::Quaternion::ONE,
         };
         main_camera.look_at(peridot::math::Vector3(0.0, 0.0, 0.0));
-        mem.apply_main_camera(e.graphics(), &main_camera, aspect);
+        mem.apply_main_camera(e.graphics_mut(), &main_camera, aspect);
         mem.set_camera_info(
-            e.graphics(),
+            e.graphics_mut(),
             RasterizationCameraInfo {
                 pos: peridot::math::Vector4(
                     main_camera.position.0,
@@ -1336,31 +1553,20 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             },
         );
         mem.set_directional_light_info(
-            e.graphics(),
+            e.graphics_mut(),
             RasterizationDirectionalLightInfo {
                 dir: -peridot::math::Vector4(0.2f32, 0.3, 0.5, 0.0).normalize(),
                 intensity: peridot::math::Vector4(2.0, 2.0, 2.0, 1.0),
             },
         );
-        let material_data = DirtyTracker::new(MaterialInfo {
-            base_color: peridot::math::Vector4(1.0, 0.0, 0.0, 1.0),
-            roughness: 0.4,
-            anisotropic: 0.0,
-            metallic: 0.0,
-            reflectance: 0.5,
+        mem.set_material(e.graphics_mut(), material_data.get().clone());
+        mem.construct_new_ui_fill_rect_vertices(e.graphics_mut(), |vs| {
+            for r in renderables {
+                r.render_dynamic_mesh(vs);
+            }
         });
-        mem.set_material(e.graphics(), material_data.get().clone());
-        mem.update_ui_fill_rect_vertices(
-            e.graphics(),
-            &mesh::build_ui_fill_rects(
-                material_data.get().roughness,
-                material_data.get().anisotropic,
-                material_data.get().metallic,
-                material_data.get().reflectance,
-            ),
-        );
         mem.set_ui_transform(
-            e.graphics(),
+            e.graphics_mut(),
             peridot::math::Camera {
                 projection: Some(peridot::math::ProjectionMethod::UI {
                     design_width: bb0.size().width as _,
@@ -1372,9 +1578,8 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
         );
         mem.ready_transfer(e.graphics(), &mut tfb);
 
-        let ui_roughness_text_rendering_buffers =
-            UIRenderingBuffers::new(e.graphics(), &ui_roughness_label, &mut tfb)
-                .expect("Failed to allocate ui roughness label");
+        let ui_dynamic_buffers = UIRenderingBuffers::new(e.graphics(), &ui_dynamic_texts, &mut tfb)
+            .expect("Failed to allocate ui dynamic buffers");
 
         e.submit_commands(|r| {
             tfb.sink_transfer_commands(r);
@@ -1382,9 +1587,10 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
         })
         .expect("Failed to initialize resources");
 
+        let descriptors = Descriptors::new(e, &const_res);
         let mut dub = peridot::DescriptorSetUpdateBatch::new();
         dub.write(
-            const_res.grid_transform_desc(),
+            descriptors.grid_transform(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1392,7 +1598,7 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             )]),
         );
         dub.write(
-            const_res.object_transform_desc(),
+            descriptors.object_transform(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1400,7 +1606,7 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             )]),
         );
         dub.write(
-            const_res.rasterization_scene_info_desc(),
+            descriptors.rasterization_scene_info(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1408,7 +1614,7 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             )]),
         );
         dub.write(
-            const_res.rasterization_scene_info_desc(),
+            descriptors.rasterization_scene_info(),
             1,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1416,7 +1622,7 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             )]),
         );
         dub.write(
-            const_res.material_info_desc(),
+            descriptors.material_info(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1424,28 +1630,28 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             )]),
         );
         dub.write(
-            const_res.ui_transform_buffer_desc(),
+            descriptors.ui_transform_buffer(),
             0,
             br::DescriptorUpdateInfo::UniformTexelBuffer(vec![mem
                 .ui_transform_buffer_view
                 .native_ptr()]),
         );
         dub.write(
-            const_res.ui_mask_transform_buffer_desc(),
+            descriptors.ui_mask_transform_buffer(),
             0,
             br::DescriptorUpdateInfo::UniformTexelBuffer(vec![mem
                 .ui_mask_transform_buffer_view
                 .native_ptr()]),
         );
         dub.write(
-            const_res.ui_roughness_text_transform_buffer_desc(),
+            descriptors.ui_dynamic_transform_buffer(),
             0,
-            br::DescriptorUpdateInfo::UniformTexelBuffer(vec![ui_roughness_text_rendering_buffers
+            br::DescriptorUpdateInfo::UniformTexelBuffer(vec![ui_dynamic_buffers
                 .transform_buffer_view
                 .native_ptr()]),
         );
         dub.write(
-            const_res.ui_fill_rect_transform_desc(),
+            descriptors.ui_fill_rect_transform(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1456,7 +1662,96 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
 
         let screen_res = ScreenResources::new(e, &const_res);
 
-        let command_buffers = peridot::CommandBundle::new(
+        let mut render_bundles = (0..5)
+            .map(|_| {
+                RenderBundle::new(e.graphics(), e.backbuffer_count() as _)
+                    .expect("Failed to create render bundle")
+            })
+            .collect::<Vec<_>>();
+        rayon::scope(|s| {
+            let (rb0, rb1, rb2, rb3, rb4) = match &mut render_bundles[..] {
+                &mut [ref mut rb0, ref mut rb1, ref mut rb2, ref mut rb3, ref mut rb4] => {
+                    (rb0, rb1, rb2, rb3, rb4)
+                }
+                _ => unreachable!(),
+            };
+
+            s.spawn(|_| {
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_ui_mask_render_commands(
+                        e,
+                        rb0.synchronized(n),
+                        &const_res.render_pass,
+                        &descriptors,
+                        &screen_res,
+                        n,
+                        &mem.mem.buffer.0,
+                        &mem.ui_mask_render_params,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_grid_render_commands(
+                        e,
+                        rb1.synchronized(n),
+                        &const_res.render_pass,
+                        &descriptors,
+                        &screen_res,
+                        n,
+                        &mem.mem.buffer.0,
+                        &mem.static_offsets,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_pbr_object_render_commands(
+                        e,
+                        rb2.synchronized(n),
+                        &const_res.render_pass,
+                        &descriptors,
+                        &screen_res,
+                        n,
+                        &mem.mem.buffer.0,
+                        &mem.static_offsets,
+                        mem.icosphere_vertex_count as _,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_static_ui_render_commands(
+                        e,
+                        rb3.synchronized(n),
+                        &const_res.render_pass,
+                        &descriptors,
+                        &screen_res,
+                        n,
+                        &mem.ui_render_params,
+                        &mem.mem.buffer.0,
+                        &mem.static_offsets,
+                        &mem.mutable_offsets,
+                        mem.mem.mut_buffer_placement,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_dynamic_ui_render_commands(
+                        e,
+                        rb4.synchronized(n),
+                        &const_res.render_pass,
+                        &descriptors,
+                        &screen_res,
+                        n,
+                        &ui_dynamic_buffers,
+                    );
+                }
+            });
+        });
+
+        let mut command_buffers = peridot::CommandBundle::new(
             e.graphics(),
             peridot::CBSubmissionType::Graphics,
             e.backbuffer_count(),
@@ -1465,11 +1760,10 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
         Self::repopulate_screen_commands(
             e,
             render_area,
-            &command_buffers,
+            &mut command_buffers,
             &const_res,
             &screen_res,
-            &mem,
-            &ui_roughness_text_rendering_buffers,
+            &render_bundles,
         );
         let update_commands =
             peridot::CommandBundle::new(e.graphics(), peridot::CBSubmissionType::Transfer, 1)
@@ -1477,24 +1771,30 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
 
         Self {
             const_res,
+            descriptors,
             mem,
-            ui_roughness_text_rendering_buffers,
+            ui_dynamic_buffers,
             main_camera,
             screen_res,
             command_buffers,
             update_commands,
+            render_bundles,
             dirty_main_camera: false,
             aspect,
             material_data,
             capturing_component: None,
             plane_touch_edge: EdgeTrigger::new(false),
+            ui_roughness_slider,
+            ui_anisotropic_slider,
+            ui_metallic_slider,
+            ui_reflectance_slider,
             ph: std::marker::PhantomData,
         }
     }
 
     fn update(
         &mut self,
-        e: &peridot::Engine<NL>,
+        e: &mut peridot::Engine<NL>,
         on_backbuffer_of: u32,
         _delta_time: std::time::Duration,
     ) -> (Option<br::SubmissionBatch>, br::SubmissionBatch) {
@@ -1505,40 +1805,45 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
         );
         if let Some(&p) = press_inframe {
             if p {
-                self.capturing_component = e
-                    .input()
-                    .get_plane_position(0)
-                    .and_then(CapturingComponent::from_point);
+                self.capturing_component = e.input().get_plane_position(0).and_then(|(px, py)| {
+                    let pv = peridot::math::Vector2(px, py);
+
+                    [
+                        &self.ui_roughness_slider,
+                        &self.ui_anisotropic_slider,
+                        &self.ui_metallic_slider,
+                        &self.ui_reflectance_slider,
+                    ]
+                    .into_iter()
+                    .fold(None, |a, c| a.or_else(|| c.try_capture_input(pv)))
+                });
             } else {
                 self.capturing_component = None;
             }
         }
+        let mut ui_mesh_dirty = false;
         if self.plane_touch_edge.current {
             // dragging
             match self.capturing_component {
                 Some(CapturingComponent::Roughness) => {
-                    if let Some((px, _)) = e.input().get_plane_position(0) {
-                        let r = ((px - UI_LEFT_MARGIN) / UI_SLIDER_WIDTH).min(1.0).max(0.0);
-                        self.material_data.modify().roughness = r;
-                    }
+                    self.ui_roughness_slider.update_capturing_input(e);
+                    self.material_data.modify().roughness = self.ui_roughness_slider.value;
+                    ui_mesh_dirty = true;
                 }
                 Some(CapturingComponent::Anisotropic) => {
-                    if let Some((px, _)) = e.input().get_plane_position(0) {
-                        let r = ((px - UI_LEFT_MARGIN) / UI_SLIDER_WIDTH).min(1.0).max(0.0);
-                        self.material_data.modify().anisotropic = r;
-                    }
+                    self.ui_anisotropic_slider.update_capturing_input(e);
+                    self.material_data.modify().anisotropic = self.ui_anisotropic_slider.value;
+                    ui_mesh_dirty = true;
                 }
                 Some(CapturingComponent::Metallic) => {
-                    if let Some((px, _)) = e.input().get_plane_position(0) {
-                        let r = ((px - UI_LEFT_MARGIN) / UI_SLIDER_WIDTH).min(1.0).max(0.0);
-                        self.material_data.modify().metallic = r;
-                    }
+                    self.ui_metallic_slider.update_capturing_input(e);
+                    self.material_data.modify().metallic = self.ui_metallic_slider.value;
+                    ui_mesh_dirty = true;
                 }
                 Some(CapturingComponent::Reflectance) => {
-                    if let Some((px, _)) = e.input().get_plane_position(0) {
-                        let r = ((px - UI_LEFT_MARGIN) / UI_SLIDER_WIDTH).min(1.0).max(0.0);
-                        self.material_data.modify().reflectance = r;
-                    }
+                    self.ui_reflectance_slider.update_capturing_input(e);
+                    self.material_data.modify().reflectance = self.ui_reflectance_slider.value;
+                    ui_mesh_dirty = true;
                 }
                 None => (),
             }
@@ -1546,22 +1851,33 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
 
         if self.dirty_main_camera {
             self.mem
-                .apply_main_camera(e.graphics(), &self.main_camera, self.aspect);
+                .apply_main_camera(e.graphics_mut(), &self.main_camera, self.aspect);
             self.dirty_main_camera = false;
         }
 
         if self.material_data.take_dirty_flag() {
             self.mem
-                .set_material(e.graphics(), self.material_data.get().clone());
-            self.mem.update_ui_fill_rect_vertices(
-                e.graphics(),
-                &mesh::build_ui_fill_rects(
-                    self.material_data.get().roughness,
-                    self.material_data.get().anisotropic,
-                    self.material_data.get().metallic,
-                    self.material_data.get().reflectance,
-                ),
-            );
+                .set_material(e.graphics_mut(), self.material_data.get().clone());
+        }
+
+        if ui_mesh_dirty {
+            let mut ui_dynamic_texts = peridot_vg::Context::new(e.rendering_precision());
+            self.mem
+                .construct_new_ui_fill_rect_vertices(e.graphics_mut(), |vs| {
+                    for c in &[
+                        &self.ui_roughness_slider,
+                        &self.ui_anisotropic_slider,
+                        &self.ui_metallic_slider,
+                        &self.ui_reflectance_slider,
+                    ] {
+                        c.render_dynamic(&mut ui_dynamic_texts);
+                        c.render_dynamic_mesh(vs);
+                    }
+                });
+            // TODO これするといろいろ作り直しが必要だな......
+            /*let ui_dynamic_buffers =
+            UIRenderingBuffers::new(e.graphics(), &ui_dynamic_texts, &mut tfb)
+                .expect("Failed to allocate ui dynamic buffers");*/
         }
 
         self.mem.ready_transfer(e.graphics(), &mut tfb);
@@ -1570,7 +1886,7 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             self.update_commands
                 .reset()
                 .expect("Failed to reset update commands");
-            {
+            unsafe {
                 let mut r = self.update_commands[0]
                     .begin()
                     .expect("Failed to begin recording update commands");
@@ -1603,29 +1919,123 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
             .expect("Failed to reset screen commands");
         self.screen_res.frame_buffers.clear();
     }
-    fn on_resize(&mut self, e: &peridot::Engine<NL>, new_size: peridot::math::Vector2<usize>) {
+    fn on_resize(&mut self, e: &mut peridot::Engine<NL>, new_size: peridot::math::Vector2<usize>) {
         self.screen_res = ScreenResources::new(e, &self.const_res);
+
+        rayon::scope(|s| {
+            let (rb0, rb1, rb2, rb3, rb4) = match &mut self.render_bundles[..] {
+                &mut [ref mut rb0, ref mut rb1, ref mut rb2, ref mut rb3, ref mut rb4] => {
+                    (rb0, rb1, rb2, rb3, rb4)
+                }
+                _ => unreachable!(),
+            };
+
+            s.spawn(|_| {
+                rb0.reset()
+                    .expect("Failed to reset ui mask render commands");
+
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_ui_mask_render_commands(
+                        e,
+                        rb0.synchronized(n),
+                        &self.const_res.render_pass,
+                        &self.descriptors,
+                        &self.screen_res,
+                        n,
+                        &self.mem.mem.buffer.0,
+                        &self.mem.ui_mask_render_params,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                rb1.reset().expect("Failed to reset grid render commands");
+
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_grid_render_commands(
+                        e,
+                        rb1.synchronized(n),
+                        &self.const_res.render_pass,
+                        &self.descriptors,
+                        &self.screen_res,
+                        n,
+                        &self.mem.mem.buffer.0,
+                        &self.mem.static_offsets,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                rb2.reset()
+                    .expect("Failed to reset pbr object render commands");
+
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_pbr_object_render_commands(
+                        e,
+                        rb2.synchronized(n),
+                        &self.const_res.render_pass,
+                        &self.descriptors,
+                        &self.screen_res,
+                        n,
+                        &self.mem.mem.buffer.0,
+                        &self.mem.static_offsets,
+                        self.mem.icosphere_vertex_count as _,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                rb3.reset()
+                    .expect("Failed to reset static ui render commands");
+
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_static_ui_render_commands(
+                        e,
+                        rb3.synchronized(n),
+                        &self.const_res.render_pass,
+                        &self.descriptors,
+                        &self.screen_res,
+                        n,
+                        &self.mem.ui_render_params,
+                        &self.mem.mem.buffer.0,
+                        &self.mem.static_offsets,
+                        &self.mem.mutable_offsets,
+                        self.mem.mem.mut_buffer_placement,
+                    );
+                }
+            });
+            s.spawn(|_| {
+                rb4.reset()
+                    .expect("Failed to reset dynamic ui render commands");
+
+                for n in 0..e.backbuffer_count() {
+                    Self::repopulate_dynamic_ui_render_commands(
+                        e,
+                        rb4.synchronized(n),
+                        &self.const_res.render_pass,
+                        &self.descriptors,
+                        &self.screen_res,
+                        n,
+                        &self.ui_dynamic_buffers,
+                    );
+                }
+            });
+        });
 
         Self::repopulate_screen_commands(
             e,
-            br::vk::VkRect2D {
-                offset: br::vk::VkOffset2D { x: 0, y: 0 },
-                extent: br::vk::VkExtent2D {
-                    width: new_size.0 as _,
-                    height: new_size.1 as _,
-                },
-            },
-            &self.command_buffers,
+            br::vk::VkExtent2D {
+                width: new_size.0 as _,
+                height: new_size.1 as _,
+            }
+            .into_rect(br::vk::VkOffset2D { x: 0, y: 0 }),
+            &mut self.command_buffers,
             &self.const_res,
             &self.screen_res,
-            &self.mem,
-            &self.ui_roughness_text_rendering_buffers,
+            &self.render_bundles,
         );
 
         self.dirty_main_camera = true;
         self.aspect = new_size.0 as f32 / new_size.1 as f32;
         self.mem.set_ui_transform(
-            e.graphics(),
+            e.graphics_mut(),
             peridot::math::Camera {
                 projection: Some(peridot::math::ProjectionMethod::UI {
                     design_width: new_size.0 as _,
@@ -1638,17 +2048,212 @@ impl<NL: peridot::NativeLinker> peridot::EngineEvents<NL> for Game<NL> {
     }
 }
 impl<NL: peridot::NativeLinker> Game<NL> {
+    fn repopulate_ui_mask_render_commands(
+        engine: &peridot::Engine<NL>,
+        mut command_buffer: br::SynchronizedCommandBuffer,
+        renderpass: &br::RenderPass,
+        descriptors: &Descriptors,
+        screen_res: &ScreenResources,
+        frame_buffer_index: usize,
+        device_buffer: &peridot::Buffer,
+        render_params: &peridot_vg::RendererParams,
+    ) {
+        let fb = &screen_res.frame_buffers[frame_buffer_index];
+        let mut rec = command_buffer
+            .begin_inherit(
+                Some((fb, renderpass, ConstResources::RENDER_STENCIL_PREPASS)),
+                None,
+            )
+            .expect("Failed to initiate ui mask render bundle recording");
+
+        render_params.default_render_commands(
+            engine,
+            &mut rec,
+            device_buffer,
+            peridot_vg::RendererExternalInstances {
+                interior_pipeline: &screen_res.vg_interior_mask_pipeline,
+                curve_pipeline: &screen_res.vg_curve_mask_pipeline,
+                transform_buffer_descriptor_set: descriptors.ui_mask_transform_buffer(),
+                target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
+            },
+        );
+    }
+
+    fn repopulate_grid_render_commands(
+        engine: &peridot::Engine<NL>,
+        mut command_buffer: br::SynchronizedCommandBuffer,
+        renderpass: &br::RenderPass,
+        descriptors: &Descriptors,
+        screen_res: &ScreenResources,
+        frame_buffer_index: usize,
+        device_buffer: &br::Buffer,
+        static_offsets: &StaticBufferOffsets,
+    ) {
+        let mut rec = command_buffer
+            .begin_inherit(
+                Some((
+                    &screen_res.frame_buffers[frame_buffer_index],
+                    renderpass,
+                    ConstResources::RENDER_MAIN_PASS,
+                )),
+                None,
+            )
+            .expect("Failed to initiate grid render bundle recording");
+
+        screen_res.grid_render_pipeline.bind(&mut rec);
+        rec.bind_graphics_descriptor_sets(0, &[descriptors.grid_transform().into()], &[]);
+        rec.bind_vertex_buffers(0, &[(device_buffer, static_offsets.grid as _)]);
+        rec.draw(mesh::GRID_MESH_LINE_COUNT as _, 1, 0, 0);
+    }
+
+    fn repopulate_pbr_object_render_commands(
+        engine: &peridot::Engine<NL>,
+        mut command_buffer: br::SynchronizedCommandBuffer,
+        renderpass: &br::RenderPass,
+        descriptors: &Descriptors,
+        screen_res: &ScreenResources,
+        frame_buffer_index: usize,
+        device_buffer: &br::Buffer,
+        static_offsets: &StaticBufferOffsets,
+        icosphere_vertex_count: u32,
+    ) {
+        let mut rec = command_buffer
+            .begin_inherit(
+                Some((
+                    &screen_res.frame_buffers[frame_buffer_index],
+                    renderpass,
+                    ConstResources::RENDER_MAIN_PASS,
+                )),
+                None,
+            )
+            .expect("Failed to initiate pbr object render bundle recording");
+
+        screen_res.pbr_pipeline.bind(&mut rec);
+        rec.bind_graphics_descriptor_sets(
+            0,
+            &[
+                descriptors.object_transform().into(),
+                descriptors.rasterization_scene_info().into(),
+                descriptors.material_info().into(),
+            ],
+            &[],
+        );
+        rec.bind_vertex_buffers(
+            0,
+            &[(device_buffer, static_offsets.icosphere_vertices as _)],
+        );
+        rec.bind_index_buffer(
+            device_buffer,
+            static_offsets.icosphere_indices as _,
+            br::IndexType::U16,
+        );
+        rec.draw_indexed(icosphere_vertex_count, 1, 0, 0, 0);
+    }
+
+    fn repopulate_static_ui_render_commands(
+        engine: &peridot::Engine<NL>,
+        mut command_buffer: br::SynchronizedCommandBuffer,
+        renderpass: &br::RenderPass,
+        descriptors: &Descriptors,
+        screen_res: &ScreenResources,
+        frame_buffer_index: usize,
+        render_params: &peridot_vg::RendererParams,
+        device_buffer: &peridot::Buffer,
+        static_offsets: &StaticBufferOffsets,
+        mutable_offsets: &MutableBufferOffsets,
+        mut_buffer_placement: u64,
+    ) {
+        let fb = &screen_res.frame_buffers[frame_buffer_index];
+        let mut rec = command_buffer
+            .begin_inherit(
+                Some((fb, renderpass, ConstResources::RENDER_MAIN_PASS)),
+                None,
+            )
+            .expect("Failed to initiate static ui render bundle recording");
+
+        screen_res.ui_fill_rect_pipeline.bind(&mut rec);
+        rec.bind_graphics_descriptor_sets(0, &[descriptors.ui_fill_rect_transform().into()], &[]);
+        rec.bind_vertex_buffers(
+            0,
+            &[(
+                device_buffer,
+                (mutable_offsets.ui_fill_rects + mut_buffer_placement) as _,
+            )],
+        );
+        rec.bind_index_buffer(
+            device_buffer,
+            static_offsets.ui_fill_rect_indices as _,
+            br::IndexType::U16,
+        );
+        rec.push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &[1.0f32, 1.0, 1.0, 0.25]);
+        rec.draw_indexed(mesh::UI_FILL_RECT_INDEX_COUNT as _, 1, 0, 0, 0);
+
+        screen_res.ui_border_line_pipeline.bind(&mut rec);
+        rec.bind_index_buffer(
+            device_buffer,
+            static_offsets.ui_border_line_indices as _,
+            br::IndexType::U16,
+        );
+        rec.push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &[1.0f32, 1.0, 1.0, 1.0]);
+        rec.draw_indexed(mesh::UI_FILL_RECT_BORDER_INDEX_COUNT as _, 1, 0, 0, 0);
+
+        render_params.default_render_commands(
+            engine,
+            &mut rec,
+            device_buffer,
+            peridot_vg::RendererExternalInstances {
+                interior_pipeline: &screen_res.vg_interior_pipeline,
+                curve_pipeline: &screen_res.vg_curve_pipeline,
+                transform_buffer_descriptor_set: descriptors.ui_transform_buffer(),
+                target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
+            },
+        );
+    }
+
+    fn repopulate_dynamic_ui_render_commands(
+        engine: &peridot::Engine<NL>,
+        mut command_buffer: br::SynchronizedCommandBuffer,
+        renderpass: &br::RenderPass,
+        descriptors: &Descriptors,
+        screen_res: &ScreenResources,
+        frame_buffer_index: usize,
+        ui_dynamic_buffers: &UIRenderingBuffers,
+    ) {
+        let fb = &screen_res.frame_buffers[frame_buffer_index];
+        let mut rec = command_buffer
+            .begin_inherit(
+                Some((fb, renderpass, ConstResources::RENDER_MAIN_PASS)),
+                None,
+            )
+            .expect("Failed to initiate static ui render bundle recording");
+
+        ui_dynamic_buffers.render_params.default_render_commands(
+            engine,
+            &mut rec,
+            &ui_dynamic_buffers.buffer,
+            peridot_vg::RendererExternalInstances {
+                interior_pipeline: &screen_res.vg_interior_inv_pipeline,
+                curve_pipeline: &screen_res.vg_curve_inv_pipeline,
+                transform_buffer_descriptor_set: descriptors.ui_dynamic_transform_buffer(),
+                target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
+            },
+        );
+    }
+
     fn repopulate_screen_commands(
         engine: &peridot::Engine<NL>,
         render_area: br::vk::VkRect2D,
-        command_buffers: &peridot::CommandBundle,
+        command_buffers: &mut peridot::CommandBundle,
         const_res: &ConstResources,
         screen_res: &ScreenResources,
-        mem: &Memory,
-        ui_roughness_text_rendering_buffers: &UIRenderingBuffers,
+        render_bundles: &[RenderBundle],
     ) {
-        for (cb, fb) in command_buffers.iter().zip(&screen_res.frame_buffers) {
-            let mut r = cb.begin().expect("Failed to begin command recording");
+        for (n, (cb, fb)) in command_buffers
+            .iter_mut()
+            .zip(&screen_res.frame_buffers)
+            .enumerate()
+        {
+            let mut r = unsafe { cb.begin().expect("Failed to begin command recording") };
             r.begin_render_pass(
                 &const_res.render_pass,
                 fb,
@@ -1657,105 +2262,20 @@ impl<NL: peridot::NativeLinker> Game<NL> {
                     br::ClearValue::color_f32([0.25 * 0.25, 0.5 * 0.25, 1.0 * 0.25, 1.0]),
                     br::ClearValue::depth_stencil(1.0, 0),
                 ],
-                true,
+                false,
             );
-            mem.ui_mask_render_params.default_render_commands(
-                engine,
-                &mut r,
-                &mem.mem.buffer.0,
-                peridot_vg::RendererExternalInstances {
-                    interior_pipeline: &screen_res.vg_interior_mask_pipeline,
-                    curve_pipeline: &screen_res.vg_curve_mask_pipeline,
-                    transform_buffer_descriptor_set: const_res.ui_mask_transform_buffer_desc(),
-                    target_pixels: peridot::math::Vector2(
-                        render_area.extent.width as _,
-                        render_area.extent.height as _,
-                    ),
-                },
-            );
-            r.next_subpass(true);
-            screen_res.grid_render_pipeline.bind(&mut r);
-            r.bind_graphics_descriptor_sets(0, &[const_res.grid_transform_desc()], &[]);
-            r.bind_vertex_buffers(0, &[(&mem.mem.buffer.0, mem.static_offsets.grid as _)]);
-            r.draw(mesh::GRID_MESH_LINE_COUNT as _, 1, 0, 0);
-            screen_res.pbr_pipeline.bind(&mut r);
-            r.bind_graphics_descriptor_sets(
-                0,
-                &[
-                    const_res.object_transform_desc(),
-                    const_res.rasterization_scene_info_desc(),
-                    const_res.material_info_desc(),
-                ],
-                &[],
-            );
-            r.bind_vertex_buffers(
-                0,
-                &[(
-                    &mem.mem.buffer.0,
-                    mem.static_offsets.icosphere_vertices as _,
-                )],
-            );
-            r.bind_index_buffer(
-                &mem.mem.buffer.0,
-                mem.static_offsets.icosphere_indices as _,
-                br::IndexType::U16,
-            );
-            r.draw_indexed(mem.icosphere_vertex_count as _, 1, 0, 0, 0);
-            screen_res.ui_fill_rect_pipeline.bind(&mut r);
-            r.bind_graphics_descriptor_sets(0, &[const_res.ui_fill_rect_transform_desc()], &[]);
-            r.bind_vertex_buffers(
-                0,
-                &[(
-                    &mem.mem.buffer.0,
-                    (mem.mutable_offsets.ui_fill_rects + mem.mem.mut_buffer_placement) as _,
-                )],
-            );
-            r.bind_index_buffer(
-                &mem.mem.buffer.0,
-                mem.static_offsets.ui_fill_rect_indices as _,
-                br::IndexType::U16,
-            );
-            r.push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &[1.0f32, 1.0, 1.0, 0.25]);
-            r.draw_indexed(mesh::UI_FILL_RECT_INDEX_COUNT as _, 1, 0, 0, 0);
-            screen_res.ui_border_line_pipeline.bind(&mut r);
-            r.bind_index_buffer(
-                &mem.mem.buffer.0,
-                mem.static_offsets.ui_border_line_indices as _,
-                br::IndexType::U16,
-            );
-            r.push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &[1.0f32, 1.0, 1.0, 1.0]);
-            r.draw_indexed(mesh::UI_FILL_RECT_BORDER_INDEX_COUNT as _, 1, 0, 0, 0);
-            mem.ui_render_params.default_render_commands(
-                engine,
-                &mut r,
-                &mem.mem.buffer.0,
-                peridot_vg::RendererExternalInstances {
-                    interior_pipeline: &screen_res.vg_interior_pipeline,
-                    curve_pipeline: &screen_res.vg_curve_pipeline,
-                    transform_buffer_descriptor_set: const_res.ui_transform_buffer_desc(),
-                    target_pixels: peridot::math::Vector2(
-                        render_area.extent.width as _,
-                        render_area.extent.height as _,
-                    ),
-                },
-            );
-            ui_roughness_text_rendering_buffers
-                .render_params
-                .default_render_commands(
-                    engine,
-                    &mut r,
-                    &ui_roughness_text_rendering_buffers.buffer,
-                    peridot_vg::RendererExternalInstances {
-                        interior_pipeline: &screen_res.vg_interior_inv_pipeline,
-                        curve_pipeline: &screen_res.vg_curve_inv_pipeline,
-                        transform_buffer_descriptor_set: const_res
-                            .ui_roughness_text_transform_buffer_desc(),
-                        target_pixels: peridot::math::Vector2(
-                            render_area.extent.width as _,
-                            render_area.extent.height as _,
-                        ),
-                    },
+            unsafe {
+                r.execute_commands(&[render_bundles[0].buffers[n].native_ptr()]);
+            }
+            r.next_subpass(false);
+            unsafe {
+                r.execute_commands(
+                    &render_bundles[1..]
+                        .iter()
+                        .map(|b| b.buffers[n].native_ptr())
+                        .collect::<Vec<_>>(),
                 );
+            }
             r.end_render_pass();
         }
     }
