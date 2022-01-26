@@ -1348,7 +1348,7 @@ impl UIRenderable for UISlider {
             self.position.1 - UI_SLIDER_VALUE_LABEL_TOP_OFFSET,
         ));
         context
-            .text(&self.label_font, &format!("{:.1}", self.value))
+            .text(&self.label_font, &format!("{:.2}", self.value))
             .expect("Text rendering failed");
     }
 
@@ -1408,6 +1408,7 @@ pub struct Game<NL: peridot::NativeLinker> {
     ui_metallic_slider: UISlider,
     ui_reflectance_slider: UISlider,
     plane_touch_edge: EdgeTrigger<bool>,
+    last_frame_tfb: peridot::TransferBatch,
     ph: std::marker::PhantomData<*const NL>,
 }
 impl<NL: peridot::NativeLinker> Game<NL> {
@@ -1788,6 +1789,7 @@ where
             ui_anisotropic_slider,
             ui_metallic_slider,
             ui_reflectance_slider,
+            last_frame_tfb: peridot::TransferBatch::new(),
             ph: std::marker::PhantomData,
         }
     }
@@ -1798,7 +1800,7 @@ where
         on_backbuffer_of: u32,
         _delta_time: std::time::Duration,
     ) -> (Option<br::SubmissionBatch>, br::SubmissionBatch) {
-        let mut tfb = peridot::TransferBatch::new();
+        self.last_frame_tfb = peridot::TransferBatch::new();
 
         let press_inframe = self.plane_touch_edge.update(
             e.input().button_pressing_time(ID_PLANE_PRESS) > std::time::Duration::default(),
@@ -1874,33 +1876,72 @@ where
                         c.render_dynamic_mesh(vs);
                     }
                 });
-            // TODO これするといろいろ作り直しが必要だな......
-            /*let ui_dynamic_buffers =
-            UIRenderingBuffers::new(e.graphics(), &ui_dynamic_texts, &mut tfb)
-                .expect("Failed to allocate ui dynamic buffers");*/
+            let ui_dynamic_buffers =
+                UIRenderingBuffers::new(e.graphics(), &ui_dynamic_texts, &mut self.last_frame_tfb)
+                    .expect("Failed to allocate ui dynamic buffers");
+            let mut dub = peridot::DescriptorSetUpdateBatch::new();
+            dub.write(
+                self.descriptors.ui_dynamic_transform_buffer(),
+                0,
+                br::DescriptorUpdateInfo::UniformTexelBuffer(vec![ui_dynamic_buffers
+                    .transform_buffer_view
+                    .native_ptr()]),
+            );
+            dub.submit(&e.graphics());
+            self.render_bundles[4]
+                .reset()
+                .expect("Failed to reset dynamic ui render bundles");
+            for n in 0..e.backbuffer_count() {
+                Self::repopulate_dynamic_ui_render_commands(
+                    e,
+                    self.render_bundles[4].synchronized(n),
+                    &self.const_res.render_pass,
+                    &self.descriptors,
+                    &self.screen_res,
+                    n,
+                    &ui_dynamic_buffers,
+                );
+            }
+            self.command_buffers
+                .reset()
+                .expect("Failed to reset command buffers");
+            Self::repopulate_screen_commands(
+                e,
+                self.screen_res.frame_buffers[0]
+                    .size()
+                    .clone()
+                    .into_rect(br::vk::VkOffset2D { x: 0, y: 0 }),
+                &mut self.command_buffers,
+                &self.const_res,
+                &self.screen_res,
+                &self.render_bundles,
+            );
+            self.ui_dynamic_buffers = ui_dynamic_buffers;
         }
 
-        self.mem.ready_transfer(e.graphics(), &mut tfb);
+        self.mem
+            .ready_transfer(e.graphics(), &mut self.last_frame_tfb);
         self.mem.dynamic_stg.clear();
-        let update_submission = if tfb.has_copy_ops() || tfb.has_ready_barrier_ops() {
-            self.update_commands
-                .reset()
-                .expect("Failed to reset update commands");
-            unsafe {
-                let mut r = self.update_commands[0]
-                    .begin()
-                    .expect("Failed to begin recording update commands");
-                tfb.sink_transfer_commands(&mut r);
-                tfb.sink_graphics_ready_commands(&mut r);
-            }
+        let update_submission =
+            if self.last_frame_tfb.has_copy_ops() || self.last_frame_tfb.has_ready_barrier_ops() {
+                self.update_commands
+                    .reset()
+                    .expect("Failed to reset update commands");
+                unsafe {
+                    let mut r = self.update_commands[0]
+                        .begin()
+                        .expect("Failed to begin recording update commands");
+                    self.last_frame_tfb.sink_transfer_commands(&mut r);
+                    self.last_frame_tfb.sink_graphics_ready_commands(&mut r);
+                }
 
-            Some(br::SubmissionBatch {
-                command_buffers: std::borrow::Cow::Borrowed(&self.update_commands[..]),
-                ..Default::default()
-            })
-        } else {
-            None
-        };
+                Some(br::SubmissionBatch {
+                    command_buffers: std::borrow::Cow::Borrowed(&self.update_commands[..]),
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
 
         (
             update_submission,
