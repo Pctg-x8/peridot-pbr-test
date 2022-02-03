@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -36,83 +37,109 @@ pub struct MaterialInfo {
     reflectance: f32,
 }
 
-pub struct Descriptors {
+pub struct DetailedDescriptorSetLayout {
+    pub object: br::DescriptorSetLayout,
+    pub pool_requirements: Vec<br::DescriptorPoolSize>,
+}
+impl DetailedDescriptorSetLayout {
+    pub fn new(
+        g: &peridot::Graphics,
+        bindings: &[br::DescriptorSetLayoutBinding],
+    ) -> br::Result<Self> {
+        let object = br::DescriptorSetLayout::new(g, bindings)?;
+        let mut pool_requirements = BTreeMap::new();
+        for b in bindings {
+            let (ty, n) = match b {
+                br::DescriptorSetLayoutBinding::UniformBuffer(count, _) => {
+                    (br::DescriptorType::UniformBuffer, count)
+                }
+                br::DescriptorSetLayoutBinding::StorageBuffer(count, _) => {
+                    (br::DescriptorType::StorageBuffer, count)
+                }
+                br::DescriptorSetLayoutBinding::UniformTexelBuffer(count, _) => {
+                    (br::DescriptorType::UniformTexelBuffer, count)
+                }
+                br::DescriptorSetLayoutBinding::StorageTexelBuffer(count, _) => {
+                    (br::DescriptorType::StorageTexelBuffer, count)
+                }
+                br::DescriptorSetLayoutBinding::UniformBufferDynamic(count, _) => {
+                    (br::DescriptorType::UniformBufferDynamic, count)
+                }
+                br::DescriptorSetLayoutBinding::StorageBufferDynamic(count, _) => {
+                    (br::DescriptorType::StorageBufferDynamic, count)
+                }
+                br::DescriptorSetLayoutBinding::CombinedImageSampler(count, _, _) => {
+                    (br::DescriptorType::CombinedImageSampler, count)
+                }
+                br::DescriptorSetLayoutBinding::Sampler(count, _, _) => {
+                    (br::DescriptorType::Sampler, count)
+                }
+                br::DescriptorSetLayoutBinding::SampledImage(count, _) => {
+                    (br::DescriptorType::SampledImage, count)
+                }
+                br::DescriptorSetLayoutBinding::StorageImage(count, _) => {
+                    (br::DescriptorType::StorageImage, count)
+                }
+                br::DescriptorSetLayoutBinding::InputAttachment(count, _) => {
+                    (br::DescriptorType::InputAttachment, count)
+                }
+            };
+
+            *pool_requirements.entry(ty).or_insert(0) += n;
+        }
+
+        Ok(Self {
+            object,
+            pool_requirements: pool_requirements
+                .into_iter()
+                .map(|(ty, n)| br::DescriptorPoolSize(ty, n))
+                .collect(),
+        })
+    }
+}
+
+pub struct DescriptorStore {
     _pool: br::DescriptorPool,
     descriptors: Vec<br::DescriptorSet>,
 }
-impl Descriptors {
+impl DescriptorStore {
     pub fn new(
-        e: &peridot::Engine<impl peridot::NativeLinker>,
-        const_res: &ConstResources,
-    ) -> Self {
+        g: &peridot::Graphics,
+        layouts: &[&DetailedDescriptorSetLayout],
+    ) -> br::Result<Self> {
+        let mut pool_sizes = BTreeMap::new();
+        for &br::DescriptorPoolSize(ty, n) in layouts.iter().flat_map(|l| &l.pool_requirements) {
+            *pool_sizes.entry(ty).or_insert(0) += n;
+        }
         let mut dp = br::DescriptorPool::new(
-            e.graphics_device(),
-            8,
-            &[
-                br::DescriptorPoolSize(br::DescriptorType::UniformBuffer, 6),
-                br::DescriptorPoolSize(br::DescriptorType::UniformTexelBuffer, 3),
-            ],
+            g,
+            layouts.len() as _,
+            &pool_sizes
+                .into_iter()
+                .map(|(ty, n)| br::DescriptorPoolSize(ty, n))
+                .collect::<Vec<_>>(),
             false,
-        )
-        .expect("Failed to create descriptor pool");
-        let descriptors = dp
-            .alloc(&[
-                &const_res.dsl_ub1,
-                &const_res.dsl_ub1,
-                &const_res.dsl_ub2_f,
-                &const_res.dsl_ub1_f,
-                &const_res.dsl_utb1,
-                &const_res.dsl_utb1,
-                &const_res.dsl_utb1,
-                &const_res.dsl_ub1,
-            ])
-            .expect("Failed to allocate descriptors");
+        )?;
 
-        Self {
+        let descriptors = dp.alloc(&layouts.iter().map(|l| &l.object).collect::<Vec<_>>())?;
+
+        Ok(Self {
             _pool: dp,
             descriptors,
-        }
+        })
     }
 
-    pub fn grid_transform(&self) -> br::DescriptorSet {
-        self.descriptors[0]
-    }
-
-    pub fn object_transform(&self) -> br::DescriptorSet {
-        self.descriptors[1]
-    }
-
-    pub fn rasterization_scene_info(&self) -> br::DescriptorSet {
-        self.descriptors[2]
-    }
-
-    pub fn material_info(&self) -> br::DescriptorSet {
-        self.descriptors[3]
-    }
-
-    pub fn ui_transform_buffer(&self) -> br::DescriptorSet {
-        self.descriptors[4]
-    }
-
-    pub fn ui_mask_transform_buffer(&self) -> br::DescriptorSet {
-        self.descriptors[5]
-    }
-
-    pub fn ui_dynamic_transform_buffer(&self) -> br::DescriptorSet {
-        self.descriptors[6]
-    }
-
-    pub fn ui_fill_rect_transform(&self) -> br::DescriptorSet {
-        self.descriptors[7]
+    pub fn descriptor(&self, index: usize) -> Option<br::DescriptorSet> {
+        self.descriptors.get(index).copied()
     }
 }
 
 pub struct ConstResources {
     render_pass: br::RenderPass,
-    dsl_ub1: br::DescriptorSetLayout,
-    dsl_ub1_f: br::DescriptorSetLayout,
-    dsl_ub2_f: br::DescriptorSetLayout,
-    dsl_utb1: br::DescriptorSetLayout,
+    dsl_ub1: DetailedDescriptorSetLayout,
+    dsl_ub1_f: DetailedDescriptorSetLayout,
+    dsl_ub2_f: DetailedDescriptorSetLayout,
+    dsl_utb1: DetailedDescriptorSetLayout,
     unlit_colored_shader: PvpShaderModules<'static>,
     unlit_colored_pipeline_layout: Arc<br::PipelineLayout>,
     pbr_shader: PvpShaderModules<'static>,
@@ -174,32 +201,32 @@ impl ConstResources {
             .create(e.graphics_device())
             .expect("Failed to create render pass");
 
-        let dsl_ub1 = br::DescriptorSetLayout::new(
-            e.graphics_device(),
+        let dsl_ub1 = DetailedDescriptorSetLayout::new(
+            e.graphics(),
             &[br::DescriptorSetLayoutBinding::UniformBuffer(
                 1,
                 br::ShaderStage::VERTEX,
             )],
         )
         .expect("Failed to create descriptor set layout");
-        let dsl_ub1_f = br::DescriptorSetLayout::new(
-            e.graphics_device(),
+        let dsl_ub1_f = DetailedDescriptorSetLayout::new(
+            e.graphics(),
             &[br::DescriptorSetLayoutBinding::UniformBuffer(
                 1,
                 br::ShaderStage::FRAGMENT,
             )],
         )
         .expect("Failed to create ub1f descriptor set layout");
-        let dsl_ub2_f = br::DescriptorSetLayout::new(
-            e.graphics_device(),
+        let dsl_ub2_f = DetailedDescriptorSetLayout::new(
+            e.graphics(),
             &[
                 br::DescriptorSetLayoutBinding::UniformBuffer(1, br::ShaderStage::FRAGMENT),
                 br::DescriptorSetLayoutBinding::UniformBuffer(1, br::ShaderStage::FRAGMENT),
             ],
         )
         .expect("Failed to create ub2f descriptor set layout");
-        let dsl_utb1 = br::DescriptorSetLayout::new(
-            e.graphics_device(),
+        let dsl_utb1 = DetailedDescriptorSetLayout::new(
+            e.graphics(),
             &[br::DescriptorSetLayoutBinding::UniformTexelBuffer(
                 1,
                 br::ShaderStage::VERTEX,
@@ -214,7 +241,7 @@ impl ConstResources {
         )
         .expect("Failed to create shader modules");
         let unlit_colored_pipeline_layout =
-            br::PipelineLayout::new(e.graphics_device(), &[&dsl_ub1], &[])
+            br::PipelineLayout::new(e.graphics_device(), &[&dsl_ub1.object], &[])
                 .expect("Failed to create unlit_colored pipeline layout")
                 .into();
 
@@ -225,7 +252,7 @@ impl ConstResources {
         .expect("Failed to create pbr shader modules");
         let pbr_pipeline_layout = br::PipelineLayout::new(
             e.graphics_device(),
-            &[&dsl_ub1, &dsl_ub2_f, &dsl_ub1_f],
+            &[&dsl_ub1.object, &dsl_ub2_f.object, &dsl_ub1_f.object],
             &[],
         )
         .expect("Failed to create pbr pipeline layout")
@@ -238,7 +265,7 @@ impl ConstResources {
         .expect("Failed to create unlit_colored_ext shader modules");
         let unlit_colored_ext_pipeline = br::PipelineLayout::new(
             e.graphics_device(),
-            &[&dsl_ub1],
+            &[&dsl_ub1.object],
             &[(br::ShaderStage::FRAGMENT, 0..16)],
         )
         .expect("Failed to create unlit_colored_ext pipeline layout")
@@ -258,7 +285,7 @@ impl ConstResources {
         .expect("Failed to create vg curve color shader modules");
         let vg_pipeline_layout = br::PipelineLayout::new(
             e.graphics_device(),
-            &[&dsl_utb1],
+            &[&dsl_utb1.object],
             &[(br::ShaderStage::VERTEX, 0..4 * 4)],
         )
         .expect("Failed to create vg pipeline layout")
@@ -1391,7 +1418,7 @@ impl RenderBundle {
 
 pub struct Game<NL: peridot::NativeLinker> {
     const_res: ConstResources,
-    descriptors: Descriptors,
+    descriptors: DescriptorStore,
     mem: Memory,
     screen_res: ScreenResources,
     ui_dynamic_buffers: UIRenderingBuffers,
@@ -1588,10 +1615,23 @@ where
         })
         .expect("Failed to initialize resources");
 
-        let descriptors = Descriptors::new(e, &const_res);
+        let descriptors = DescriptorStore::new(
+            e.graphics(),
+            &[
+                &const_res.dsl_ub1,
+                &const_res.dsl_ub1,
+                &const_res.dsl_ub2_f,
+                &const_res.dsl_ub1_f,
+                &const_res.dsl_utb1,
+                &const_res.dsl_utb1,
+                &const_res.dsl_utb1,
+                &const_res.dsl_ub1,
+            ],
+        )
+        .expect("Failed to allocate descriptors");
         let mut dub = peridot::DescriptorSetUpdateBatch::new();
         dub.write(
-            descriptors.grid_transform(),
+            descriptors.descriptor(0).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1599,7 +1639,7 @@ where
             )]),
         );
         dub.write(
-            descriptors.object_transform(),
+            descriptors.descriptor(1).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1607,7 +1647,7 @@ where
             )]),
         );
         dub.write(
-            descriptors.rasterization_scene_info(),
+            descriptors.descriptor(2).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1615,7 +1655,7 @@ where
             )]),
         );
         dub.write(
-            descriptors.rasterization_scene_info(),
+            descriptors.descriptor(2).unwrap(),
             1,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1623,7 +1663,7 @@ where
             )]),
         );
         dub.write(
-            descriptors.material_info(),
+            descriptors.descriptor(3).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1631,28 +1671,28 @@ where
             )]),
         );
         dub.write(
-            descriptors.ui_transform_buffer(),
+            descriptors.descriptor(4).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformTexelBuffer(vec![mem
                 .ui_transform_buffer_view
                 .native_ptr()]),
         );
         dub.write(
-            descriptors.ui_mask_transform_buffer(),
+            descriptors.descriptor(5).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformTexelBuffer(vec![mem
                 .ui_mask_transform_buffer_view
                 .native_ptr()]),
         );
         dub.write(
-            descriptors.ui_dynamic_transform_buffer(),
+            descriptors.descriptor(6).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformTexelBuffer(vec![ui_dynamic_buffers
                 .transform_buffer_view
                 .native_ptr()]),
         );
         dub.write(
-            descriptors.ui_fill_rect_transform(),
+            descriptors.descriptor(7).unwrap(),
             0,
             br::DescriptorUpdateInfo::UniformBuffer(vec![(
                 mem.mem.buffer.0.native_ptr(),
@@ -1683,10 +1723,10 @@ where
                         e,
                         rb0.synchronized(n),
                         &const_res.render_pass,
-                        &descriptors,
                         &screen_res,
                         n,
                         &mem.mem.buffer.0,
+                        descriptors.descriptor(5).unwrap(),
                         &mem.ui_mask_render_params,
                     );
                 }
@@ -1697,11 +1737,11 @@ where
                         e,
                         rb1.synchronized(n),
                         &const_res.render_pass,
-                        &descriptors,
                         &screen_res,
                         n,
                         &mem.mem.buffer.0,
                         &mem.static_offsets,
+                        descriptors.descriptor(0).unwrap(),
                     );
                 }
             });
@@ -1711,12 +1751,14 @@ where
                         e,
                         rb2.synchronized(n),
                         &const_res.render_pass,
-                        &descriptors,
                         &screen_res,
                         n,
                         &mem.mem.buffer.0,
                         &mem.static_offsets,
                         mem.icosphere_vertex_count as _,
+                        descriptors.descriptor(1).unwrap(),
+                        descriptors.descriptor(2).unwrap(),
+                        descriptors.descriptor(3).unwrap(),
                     );
                 }
             });
@@ -1726,7 +1768,6 @@ where
                         e,
                         rb3.synchronized(n),
                         &const_res.render_pass,
-                        &descriptors,
                         &screen_res,
                         n,
                         &mem.ui_render_params,
@@ -1734,6 +1775,8 @@ where
                         &mem.static_offsets,
                         &mem.mutable_offsets,
                         mem.mem.mut_buffer_placement,
+                        descriptors.descriptor(7).unwrap(),
+                        descriptors.descriptor(4).unwrap(),
                     );
                 }
             });
@@ -1743,10 +1786,10 @@ where
                         e,
                         rb4.synchronized(n),
                         &const_res.render_pass,
-                        &descriptors,
                         &screen_res,
                         n,
                         &ui_dynamic_buffers,
+                        descriptors.descriptor(6).unwrap(),
                     );
                 }
             });
@@ -1881,7 +1924,7 @@ where
                     .expect("Failed to allocate ui dynamic buffers");
             let mut dub = peridot::DescriptorSetUpdateBatch::new();
             dub.write(
-                self.descriptors.ui_dynamic_transform_buffer(),
+                self.descriptors.descriptor(6).unwrap(),
                 0,
                 br::DescriptorUpdateInfo::UniformTexelBuffer(vec![ui_dynamic_buffers
                     .transform_buffer_view
@@ -1896,10 +1939,10 @@ where
                     e,
                     self.render_bundles[4].synchronized(n),
                     &self.const_res.render_pass,
-                    &self.descriptors,
                     &self.screen_res,
                     n,
                     &ui_dynamic_buffers,
+                    self.descriptors.descriptor(6).unwrap(),
                 );
             }
             self.command_buffers
@@ -1972,66 +2015,56 @@ where
             };
 
             s.spawn(|_| {
-                rb0.reset()
-                    .expect("Failed to reset ui mask render commands");
-
                 for n in 0..e.backbuffer_count() {
                     Self::repopulate_ui_mask_render_commands(
                         e,
                         rb0.synchronized(n),
                         &self.const_res.render_pass,
-                        &self.descriptors,
                         &self.screen_res,
                         n,
                         &self.mem.mem.buffer.0,
+                        self.descriptors.descriptor(5).unwrap(),
                         &self.mem.ui_mask_render_params,
                     );
                 }
             });
             s.spawn(|_| {
-                rb1.reset().expect("Failed to reset grid render commands");
-
                 for n in 0..e.backbuffer_count() {
                     Self::repopulate_grid_render_commands(
                         e,
                         rb1.synchronized(n),
                         &self.const_res.render_pass,
-                        &self.descriptors,
                         &self.screen_res,
                         n,
                         &self.mem.mem.buffer.0,
                         &self.mem.static_offsets,
+                        self.descriptors.descriptor(0).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                rb2.reset()
-                    .expect("Failed to reset pbr object render commands");
-
                 for n in 0..e.backbuffer_count() {
                     Self::repopulate_pbr_object_render_commands(
                         e,
                         rb2.synchronized(n),
                         &self.const_res.render_pass,
-                        &self.descriptors,
                         &self.screen_res,
                         n,
                         &self.mem.mem.buffer.0,
                         &self.mem.static_offsets,
                         self.mem.icosphere_vertex_count as _,
+                        self.descriptors.descriptor(1).unwrap(),
+                        self.descriptors.descriptor(2).unwrap(),
+                        self.descriptors.descriptor(3).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                rb3.reset()
-                    .expect("Failed to reset static ui render commands");
-
                 for n in 0..e.backbuffer_count() {
                     Self::repopulate_static_ui_render_commands(
                         e,
                         rb3.synchronized(n),
                         &self.const_res.render_pass,
-                        &self.descriptors,
                         &self.screen_res,
                         n,
                         &self.mem.ui_render_params,
@@ -2039,22 +2072,21 @@ where
                         &self.mem.static_offsets,
                         &self.mem.mutable_offsets,
                         self.mem.mem.mut_buffer_placement,
+                        self.descriptors.descriptor(7).unwrap(),
+                        self.descriptors.descriptor(4).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                rb4.reset()
-                    .expect("Failed to reset dynamic ui render commands");
-
                 for n in 0..e.backbuffer_count() {
                     Self::repopulate_dynamic_ui_render_commands(
                         e,
                         rb4.synchronized(n),
                         &self.const_res.render_pass,
-                        &self.descriptors,
                         &self.screen_res,
                         n,
                         &self.ui_dynamic_buffers,
+                        self.descriptors.descriptor(6).unwrap(),
                     );
                 }
             });
@@ -2093,10 +2125,10 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         engine: &peridot::Engine<NL>,
         mut command_buffer: br::SynchronizedCommandBuffer,
         renderpass: &br::RenderPass,
-        descriptors: &Descriptors,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
         device_buffer: &peridot::Buffer,
+        transform_buffer_desc: br::DescriptorSet,
         render_params: &peridot_vg::RendererParams,
     ) {
         let fb = &screen_res.frame_buffers[frame_buffer_index];
@@ -2114,7 +2146,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             peridot_vg::RendererExternalInstances {
                 interior_pipeline: &screen_res.vg_interior_mask_pipeline,
                 curve_pipeline: &screen_res.vg_curve_mask_pipeline,
-                transform_buffer_descriptor_set: descriptors.ui_mask_transform_buffer(),
+                transform_buffer_descriptor_set: transform_buffer_desc,
                 target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
             },
         );
@@ -2124,11 +2156,11 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         engine: &peridot::Engine<NL>,
         mut command_buffer: br::SynchronizedCommandBuffer,
         renderpass: &br::RenderPass,
-        descriptors: &Descriptors,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
         device_buffer: &br::Buffer,
         static_offsets: &StaticBufferOffsets,
+        grid_transform_desc: br::DescriptorSet,
     ) {
         let mut rec = command_buffer
             .begin_inherit(
@@ -2142,7 +2174,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             .expect("Failed to initiate grid render bundle recording");
 
         screen_res.grid_render_pipeline.bind(&mut rec);
-        rec.bind_graphics_descriptor_sets(0, &[descriptors.grid_transform().into()], &[]);
+        rec.bind_graphics_descriptor_sets(0, &[grid_transform_desc.into()], &[]);
         rec.bind_vertex_buffers(0, &[(device_buffer, static_offsets.grid as _)]);
         rec.draw(mesh::GRID_MESH_LINE_COUNT as _, 1, 0, 0);
     }
@@ -2151,12 +2183,14 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         engine: &peridot::Engine<NL>,
         mut command_buffer: br::SynchronizedCommandBuffer,
         renderpass: &br::RenderPass,
-        descriptors: &Descriptors,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
         device_buffer: &br::Buffer,
         static_offsets: &StaticBufferOffsets,
         icosphere_vertex_count: u32,
+        object_transform_desc: br::DescriptorSet,
+        rasterization_scene_info_desc: br::DescriptorSet,
+        material_info_desc: br::DescriptorSet,
     ) {
         let mut rec = command_buffer
             .begin_inherit(
@@ -2173,9 +2207,9 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         rec.bind_graphics_descriptor_sets(
             0,
             &[
-                descriptors.object_transform().into(),
-                descriptors.rasterization_scene_info().into(),
-                descriptors.material_info().into(),
+                object_transform_desc.into(),
+                rasterization_scene_info_desc.into(),
+                material_info_desc.into(),
             ],
             &[],
         );
@@ -2195,7 +2229,6 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         engine: &peridot::Engine<NL>,
         mut command_buffer: br::SynchronizedCommandBuffer,
         renderpass: &br::RenderPass,
-        descriptors: &Descriptors,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
         render_params: &peridot_vg::RendererParams,
@@ -2203,6 +2236,8 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         static_offsets: &StaticBufferOffsets,
         mutable_offsets: &MutableBufferOffsets,
         mut_buffer_placement: u64,
+        fill_rect_transform_desc: br::DescriptorSet,
+        vg_transform_desc: br::DescriptorSet,
     ) {
         let fb = &screen_res.frame_buffers[frame_buffer_index];
         let mut rec = command_buffer
@@ -2213,7 +2248,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             .expect("Failed to initiate static ui render bundle recording");
 
         screen_res.ui_fill_rect_pipeline.bind(&mut rec);
-        rec.bind_graphics_descriptor_sets(0, &[descriptors.ui_fill_rect_transform().into()], &[]);
+        rec.bind_graphics_descriptor_sets(0, &[fill_rect_transform_desc.into()], &[]);
         rec.bind_vertex_buffers(
             0,
             &[(
@@ -2245,7 +2280,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             peridot_vg::RendererExternalInstances {
                 interior_pipeline: &screen_res.vg_interior_pipeline,
                 curve_pipeline: &screen_res.vg_curve_pipeline,
-                transform_buffer_descriptor_set: descriptors.ui_transform_buffer(),
+                transform_buffer_descriptor_set: vg_transform_desc,
                 target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
             },
         );
@@ -2255,10 +2290,10 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         engine: &peridot::Engine<NL>,
         mut command_buffer: br::SynchronizedCommandBuffer,
         renderpass: &br::RenderPass,
-        descriptors: &Descriptors,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
         ui_dynamic_buffers: &UIRenderingBuffers,
+        transform_desc: br::DescriptorSet,
     ) {
         let fb = &screen_res.frame_buffers[frame_buffer_index];
         let mut rec = command_buffer
@@ -2275,7 +2310,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             peridot_vg::RendererExternalInstances {
                 interior_pipeline: &screen_res.vg_interior_inv_pipeline,
                 curve_pipeline: &screen_res.vg_curve_inv_pipeline,
-                transform_buffer_descriptor_set: descriptors.ui_dynamic_transform_buffer(),
+                transform_buffer_descriptor_set: transform_desc,
                 target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
             },
         );
