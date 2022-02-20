@@ -3,3 +3,4 @@ Cargo.lock
 *.pvp
 /built
 *.hdr
+/.vscode
