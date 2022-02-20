@@ -1085,6 +1085,15 @@ impl<T> DirtyTracker<T> {
         self.dirty = false;
         d
     }
+
+    pub fn try_set_dirty_neq(&mut self, value: T)
+    where
+        T: PartialEq,
+    {
+        if self.value != value {
+            *self.modify() = value;
+        }
+    }
 }
 
 pub struct EdgeTrigger<T: Eq> {
@@ -1103,6 +1112,12 @@ impl<T: Eq> EdgeTrigger<T> {
 }
 
 const ID_PLANE_PRESS: u16 = 0;
+const ID_CAMERA_MOVE_AX_X: u8 = 0;
+const ID_CAMERA_MOVE_AX_Y: u8 = 1;
+const ID_CAMERA_MOVE_AX_Z: u8 = 2;
+const ID_CAMERA_ROT_AX_X: u8 = 3;
+const ID_CAMERA_ROT_AX_Y: u8 = 4;
+
 #[derive(Clone, Copy)]
 pub enum CapturingComponent {
     Roughness,
@@ -1389,6 +1404,116 @@ impl RenderBundle {
     }
 }
 
+pub struct Differential<T>
+where
+    T: std::ops::Sub<T, Output = T> + Copy,
+{
+    current_value: T,
+}
+impl<T> Differential<T>
+where
+    T: std::ops::Sub<T, Output = T> + Copy,
+{
+    pub fn new(init_value: T) -> Self {
+        Self {
+            current_value: init_value,
+        }
+    }
+
+    pub fn update(&mut self, new_value: T) -> T {
+        let d = self.current_value - new_value;
+        self.current_value = new_value;
+        d
+    }
+}
+
+pub struct FreeCameraView {
+    xrot: DirtyTracker<f32>,
+    yrot: DirtyTracker<f32>,
+    rot_x_input_diff: Differential<f32>,
+    rot_y_input_diff: Differential<f32>,
+    camera: DirtyTracker<(peridot::math::Camera, f32)>,
+}
+impl FreeCameraView {
+    pub fn new(
+        init_xrot: f32,
+        init_yrot: f32,
+        init_camera_distance: f32,
+        init_aspect_value: f32,
+    ) -> Self {
+        let init_rot = peridot::math::Quaternion::new(init_yrot, peridot::math::Vector3::RIGHT)
+            * peridot::math::Quaternion::new(init_xrot, peridot::math::Vector3::DOWN);
+
+        Self {
+            xrot: DirtyTracker::new(init_xrot),
+            yrot: DirtyTracker::new(init_yrot),
+            rot_x_input_diff: Differential::new(0.0),
+            rot_y_input_diff: Differential::new(0.0),
+            camera: DirtyTracker::new((
+                peridot::math::Camera {
+                    projection: Some(peridot::math::ProjectionMethod::Perspective {
+                        fov: 60.0f32.to_radians(),
+                    }),
+                    depth_range: 0.1..100.0,
+                    position: peridot::math::Matrix3::from(init_rot)
+                        * peridot::math::Vector3::back()
+                        * init_camera_distance,
+                    rotation: init_rot,
+                },
+                init_aspect_value,
+            )),
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        e: &peridot::Engine<impl peridot::NativeLinker>,
+        dt: std::time::Duration,
+        current_capturing: Option<CapturingComponent>,
+    ) {
+        let rdx = self
+            .rot_x_input_diff
+            .update(e.input().analog_value_abs(ID_CAMERA_ROT_AX_X));
+        let rdy = self
+            .rot_y_input_diff
+            .update(e.input().analog_value_abs(ID_CAMERA_ROT_AX_Y));
+
+        if current_capturing.is_none() && !e.input().button_pressing_time(ID_PLANE_PRESS).is_zero()
+        {
+            self.xrot
+                .try_set_dirty_neq(self.xrot.get() + rdx.to_radians() * 0.125);
+            self.yrot.try_set_dirty_neq(
+                (self.yrot.get() + rdy.to_radians() * 0.125)
+                    .clamp(-85.0f32.to_radians(), 85.0f32.to_radians()),
+            );
+        }
+
+        let dx = self.xrot.take_dirty_flag();
+        let dy = self.yrot.take_dirty_flag();
+        if dx || dy {
+            self.camera.modify().0.rotation =
+                peridot::math::Quaternion::new(*self.yrot.get(), peridot::math::Vector3::RIGHT)
+                    * peridot::math::Quaternion::new(
+                        *self.xrot.get(),
+                        peridot::math::Vector3::DOWN,
+                    );
+        }
+
+        let mx = e.input().analog_value_abs(ID_CAMERA_MOVE_AX_X);
+        let my = e.input().analog_value_abs(ID_CAMERA_MOVE_AX_Y);
+        let mz = e.input().analog_value_abs(ID_CAMERA_MOVE_AX_Z);
+
+        if mx != 0.0 || my != 0.0 || mz != 0.0 {
+            let xzv = peridot::math::Matrix3::from(peridot::math::Quaternion::new(
+                *self.xrot.get(),
+                peridot::math::Vector3::DOWN,
+            )) * peridot::math::Vector3(mx, 0.0, mz);
+            self.camera.modify().0.position +=
+                (xzv + peridot::math::Vector3(0.0, my, 0.0)) * 2.0 * dt.as_secs_f32();
+        }
+    }
+}
+
 pub struct Game<NL: peridot::NativeLinker> {
     const_res: ConstResources,
     descriptors: Descriptors,
@@ -1398,9 +1523,7 @@ pub struct Game<NL: peridot::NativeLinker> {
     command_buffers: peridot::CommandBundle,
     update_commands: peridot::CommandBundle,
     render_bundles: Vec<RenderBundle>,
-    main_camera: peridot::math::Camera,
-    aspect: f32,
-    dirty_main_camera: bool,
+    main_camera: FreeCameraView,
     material_data: DirtyTracker<MaterialInfo>,
     capturing_component: Option<CapturingComponent>,
     ui_roughness_slider: UISlider,
@@ -1423,6 +1546,31 @@ where
     fn init(e: &mut peridot::Engine<NL>) -> Self {
         e.input_mut()
             .map(peridot::NativeButtonInput::Mouse(0), ID_PLANE_PRESS);
+        e.input_mut().map(
+            peridot::AxisKey {
+                positive_key: peridot::NativeButtonInput::Character('D'),
+                negative_key: peridot::NativeButtonInput::Character('A'),
+            },
+            ID_CAMERA_MOVE_AX_X,
+        );
+        e.input_mut().map(
+            peridot::AxisKey {
+                positive_key: peridot::NativeButtonInput::Character('W'),
+                negative_key: peridot::NativeButtonInput::Character('S'),
+            },
+            ID_CAMERA_MOVE_AX_Z,
+        );
+        e.input_mut().map(
+            peridot::AxisKey {
+                positive_key: peridot::NativeButtonInput::Character('Q'),
+                negative_key: peridot::NativeButtonInput::Character('Z'),
+            },
+            ID_CAMERA_MOVE_AX_Y,
+        );
+        e.input_mut()
+            .map(peridot::NativeAnalogInput::MouseX, ID_CAMERA_ROT_AX_X);
+        e.input_mut()
+            .map(peridot::NativeAnalogInput::MouseY, ID_CAMERA_ROT_AX_Y);
 
         let material_data = DirtyTracker::new(MaterialInfo {
             base_color: peridot::math::Vector4(1.0, 0.0, 0.0, 1.0),
@@ -1532,23 +1680,15 @@ where
         let const_res = ConstResources::new(e);
         let mut tfb = peridot::TransferBatch::new();
         let mut mem = Memory::new(e, &mut tfb, &ui, &ui_control_mask);
-        let mut main_camera = peridot::math::Camera {
-            projection: Some(peridot::math::ProjectionMethod::Perspective {
-                fov: 60.0f32.to_radians(),
-            }),
-            depth_range: 0.1..100.0,
-            position: peridot::math::Vector3(2.0, 1.0, -5.0),
-            rotation: peridot::math::Quaternion::ONE,
-        };
-        main_camera.look_at(peridot::math::Vector3(0.0, 0.0, 0.0));
-        mem.apply_main_camera(e.graphics_mut(), &main_camera, aspect);
+        let main_camera = FreeCameraView::new(0.0, -5.0f32.to_radians(), 5.0, aspect);
+        mem.apply_main_camera(e.graphics_mut(), &main_camera.camera.get().0, aspect);
         mem.set_camera_info(
             e.graphics_mut(),
             RasterizationCameraInfo {
                 pos: peridot::math::Vector4(
-                    main_camera.position.0,
-                    main_camera.position.1,
-                    main_camera.position.2,
+                    main_camera.camera.get().0.position.0,
+                    main_camera.camera.get().0.position.1,
+                    main_camera.camera.get().0.position.2,
                     1.0,
                 ),
             },
@@ -1780,8 +1920,6 @@ where
             command_buffers,
             update_commands,
             render_bundles,
-            dirty_main_camera: false,
-            aspect,
             material_data,
             capturing_component: None,
             plane_touch_edge: EdgeTrigger::new(false),
@@ -1798,13 +1936,13 @@ where
         &mut self,
         e: &mut peridot::Engine<NL>,
         on_backbuffer_of: u32,
-        _delta_time: std::time::Duration,
+        delta_time: std::time::Duration,
     ) -> (Option<br::SubmissionBatch>, br::SubmissionBatch) {
         self.last_frame_tfb = peridot::TransferBatch::new();
 
-        let press_inframe = self.plane_touch_edge.update(
-            e.input().button_pressing_time(ID_PLANE_PRESS) > std::time::Duration::default(),
-        );
+        let press_inframe = self
+            .plane_touch_edge
+            .update(!e.input().button_pressing_time(ID_PLANE_PRESS).is_zero());
         if let Some(&p) = press_inframe {
             if p {
                 self.capturing_component = e.input().get_plane_position(0).and_then(|(px, py)| {
@@ -1851,10 +1989,15 @@ where
             }
         }
 
-        if self.dirty_main_camera {
-            self.mem
-                .apply_main_camera(e.graphics_mut(), &self.main_camera, self.aspect);
-            self.dirty_main_camera = false;
+        self.main_camera
+            .update(e, delta_time, self.capturing_component);
+
+        if self.main_camera.camera.take_dirty_flag() {
+            self.mem.apply_main_camera(
+                e.graphics_mut(),
+                &self.main_camera.camera.get().0,
+                self.main_camera.camera.get().1,
+            );
         }
 
         if self.material_data.take_dirty_flag() {
@@ -2073,8 +2216,8 @@ where
             &self.render_bundles,
         );
 
-        self.dirty_main_camera = true;
-        self.aspect = new_size.0 as f32 / new_size.1 as f32;
+        let new_aspect = new_size.0 as f32 / new_size.1 as f32;
+        self.main_camera.camera.modify().1 = new_aspect;
         self.mem.set_ui_transform(
             e.graphics_mut(),
             peridot::math::Camera {
@@ -2084,7 +2227,7 @@ where
                 }),
                 ..Default::default()
             }
-            .projection_matrix(self.aspect),
+            .projection_matrix(new_aspect),
         );
     }
 }
