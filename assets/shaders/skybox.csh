@@ -1,3 +1,5 @@
+// ported from https://learnopengl.com/PBR/IBL/Diffuse-irradiance
+
 VertexInput {
     Binding 0 [PerVertex] { pos: vec4; }
 }
