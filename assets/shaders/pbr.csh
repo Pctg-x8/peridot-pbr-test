@@ -39,8 +39,9 @@ Header[FragmentShader] {
     // Schlicks approximation method
     vec3 Fresnel(vec3 outDir, vec3 h, vec3 albedo) {
         const vec3 f0 = 0.16 * reflectance * reflectance * (1.0 - metallic) + albedo * metallic;
+        const float u = clamp(dot(lightDir.xyz, h), 0.0, 1.0);
 
-        return f0 + (1.0 - f0) * pow(1.0 - dot(outDir, h), 5.0);
+        return f0 + (1.0 - f0) * pow(1.0 - u, 5.0);
     }
 
     vec3 SpecularBRDF(vec3 light, vec3 outDir, vec3 albedo) {
@@ -54,21 +55,22 @@ Header[FragmentShader] {
 
     // Simple Lambert approximation
     vec3 DiffuseBRDF(vec3 albedo) {
-        return albedo / PI;
+        return max(texture(envIrradianceMap, normal_v).rgb, 0.0) * albedo / PI;
     }
 
     vec3 CalcDirectionalLightReflectIntensity(vec3 outDir) {
         const vec3 albedo = baseColor.xyz;
         const vec3 ks = Fresnel(outDir, normalize(lightDir.xyz + outDir), albedo);
         const vec3 kd = (vec3(1.0) - ks) * (1.0 - metallic);
-        const vec3 brdf = kd * DiffuseBRDF(albedo) + SpecularBRDF(lightDir.xyz, outDir, albedo);
+        const vec3 brdf = DiffuseBRDF(albedo) + SpecularBRDF(lightDir.xyz, outDir, albedo) * lightIntensity.xyz * dot(normal_v, lightDir.xyz);
+        // const vec3 brdf = DiffuseBRDF(albedo);
 
-        return brdf * lightIntensity.xyz * dot(normal_v, lightDir.xyz);
+        return brdf;
     }
 }
 FragmentShader {
     const vec3 outDir = normalize((cameraPos - worldPos).xyz);
-    Target[0] = vec4(CalcDirectionalLightReflectIntensity(outDir) + 0.03 * baseColor.xyz, 1.0) * baseColor.a;
+    Target[0] = vec4(CalcDirectionalLightReflectIntensity(outDir), 1.0) * baseColor.a;
 }
 
 Varyings VertexShader -> FragmentShader {
@@ -89,3 +91,4 @@ Uniform[FragmentShader](2, 0) Material {
     vec4 baseColor;
     float roughness, anisotropic, metallic, reflectance;
 }
+SamplerCube[FragmentShader](3, 0) envIrradianceMap

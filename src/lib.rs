@@ -268,7 +268,12 @@ impl ConstResources {
         .expect("Failed to create pbr shader modules");
         let pbr_pipeline_layout = br::PipelineLayout::new(
             e.graphics_device(),
-            &[&dsl_ub1.object, &dsl_ub2_f.object, &dsl_ub1_f.object],
+            &[
+                &dsl_ub1.object,
+                &dsl_ub2_f.object,
+                &dsl_ub1_f.object,
+                &dsl_ics1_f.object,
+            ],
             &[],
         )
         .expect("Failed to create pbr pipeline layout")
@@ -766,6 +771,7 @@ pub struct Memory {
     ui_mask_transform_buffer_view: br::BufferView,
     dwts: peridot::DeviceWorkingTextureStore,
     dwt_ibl_cubemap: peridot::DeviceWorkingCubeTextureRef,
+    dwt_irradiance_cubemap: peridot::DeviceWorkingCubeTextureRef,
 }
 impl Memory {
     pub fn new(
@@ -850,6 +856,11 @@ impl Memory {
             peridot::PixelFormat::RGBA64F,
             br::ImageUsage::COLOR_ATTACHMENT.sampled(),
         );
+        let dwt_irradiance_cubemap = dwt.new_cube(
+            peridot::math::Vector2(32, 32),
+            peridot::PixelFormat::RGBA64F,
+            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+        );
         let dwts = dwt.alloc(e.graphics()).expect("Failed to allocate dwts");
 
         Self {
@@ -880,6 +891,7 @@ impl Memory {
             icosphere_vertex_count: icosphere.indices.len(),
             dwts,
             dwt_ibl_cubemap,
+            dwt_irradiance_cubemap,
         }
     }
 
@@ -1590,7 +1602,7 @@ impl FreeCameraView {
         init_aspect_value: f32,
     ) -> Self {
         let init_rot = peridot::math::Quaternion::new(init_yrot, peridot::math::Vector3::RIGHT)
-            * peridot::math::Quaternion::new(init_xrot, peridot::math::Vector3::DOWN);
+            * peridot::math::Quaternion::new(init_xrot, peridot::math::Vector3::UP);
 
         Self {
             xrot: DirtyTracker::new(init_xrot),
@@ -1641,10 +1653,7 @@ impl FreeCameraView {
         if dx || dy {
             self.camera.modify().0.rotation =
                 peridot::math::Quaternion::new(*self.yrot.get(), peridot::math::Vector3::RIGHT)
-                    * peridot::math::Quaternion::new(
-                        *self.xrot.get(),
-                        peridot::math::Vector3::DOWN,
-                    );
+                    * peridot::math::Quaternion::new(*self.xrot.get(), peridot::math::Vector3::UP);
         }
 
         let mx = e.input().analog_value_abs(ID_CAMERA_MOVE_AX_X);
@@ -1654,7 +1663,7 @@ impl FreeCameraView {
         if mx != 0.0 || my != 0.0 || mz != 0.0 {
             let xzv = peridot::math::Matrix3::from(peridot::math::Quaternion::new(
                 *self.xrot.get(),
-                peridot::math::Vector3::DOWN,
+                peridot::math::Vector3::UP,
             )) * peridot::math::Vector3(mx, 0.0, mz);
             self.camera.modify().0.position +=
                 (xzv + peridot::math::Vector3(0.0, my, 0.0)) * 2.0 * dt.as_secs_f32();
@@ -1721,7 +1730,7 @@ where
             .map(peridot::NativeAnalogInput::MouseY, ID_CAMERA_ROT_AX_Y);
 
         let material_data = DirtyTracker::new(MaterialInfo {
-            base_color: peridot::math::Vector4(1.0, 0.0, 0.0, 1.0),
+            base_color: peridot::math::Vector4(1.0, 1.0, 1.0, 1.0),
             roughness: 0.4,
             anisotropic: 0.0,
             metallic: 0.0,
@@ -1970,53 +1979,53 @@ where
             )
             .clone_from_slice(&[
                 [
-                    peridot::math::Vector4(1.0, -1.0, 1.0, 1.0),
-                    peridot::math::Vector4(1.0, -1.0, -1.0, 1.0),
                     peridot::math::Vector4(1.0, 1.0, 1.0, 1.0),
                     peridot::math::Vector4(1.0, 1.0, -1.0, 1.0),
+                    peridot::math::Vector4(1.0, -1.0, 1.0, 1.0),
+                    peridot::math::Vector4(1.0, -1.0, -1.0, 1.0),
                 ],
                 [
-                    peridot::math::Vector4(-1.0, -1.0, -1.0, 1.0),
-                    peridot::math::Vector4(-1.0, -1.0, 1.0, 1.0),
                     peridot::math::Vector4(-1.0, 1.0, -1.0, 1.0),
                     peridot::math::Vector4(-1.0, 1.0, 1.0, 1.0),
-                ],
-                [
                     peridot::math::Vector4(-1.0, -1.0, -1.0, 1.0),
-                    peridot::math::Vector4(1.0, -1.0, -1.0, 1.0),
                     peridot::math::Vector4(-1.0, -1.0, 1.0, 1.0),
-                    peridot::math::Vector4(1.0, -1.0, 1.0, 1.0),
                 ],
                 [
-                    peridot::math::Vector4(-1.0, 1.0, 1.0, 1.0),
-                    peridot::math::Vector4(1.0, 1.0, 1.0, 1.0),
                     peridot::math::Vector4(-1.0, 1.0, -1.0, 1.0),
                     peridot::math::Vector4(1.0, 1.0, -1.0, 1.0),
-                ],
-                [
-                    peridot::math::Vector4(-1.0, -1.0, 1.0, 1.0),
-                    peridot::math::Vector4(1.0, -1.0, 1.0, 1.0),
                     peridot::math::Vector4(-1.0, 1.0, 1.0, 1.0),
                     peridot::math::Vector4(1.0, 1.0, 1.0, 1.0),
                 ],
                 [
-                    peridot::math::Vector4(1.0, -1.0, -1.0, 1.0),
+                    peridot::math::Vector4(-1.0, -1.0, 1.0, 1.0),
+                    peridot::math::Vector4(1.0, -1.0, 1.0, 1.0),
                     peridot::math::Vector4(-1.0, -1.0, -1.0, 1.0),
+                    peridot::math::Vector4(1.0, -1.0, -1.0, 1.0),
+                ],
+                [
+                    peridot::math::Vector4(-1.0, 1.0, 1.0, 1.0),
+                    peridot::math::Vector4(1.0, 1.0, 1.0, 1.0),
+                    peridot::math::Vector4(-1.0, -1.0, 1.0, 1.0),
+                    peridot::math::Vector4(1.0, -1.0, 1.0, 1.0),
+                ],
+                [
                     peridot::math::Vector4(1.0, 1.0, -1.0, 1.0),
                     peridot::math::Vector4(-1.0, 1.0, -1.0, 1.0),
+                    peridot::math::Vector4(1.0, -1.0, -1.0, 1.0),
+                    peridot::math::Vector4(-1.0, -1.0, -1.0, 1.0),
                 ],
             ]);
         }
         m0.end();
 
-        let equirect_to_cubemap_rp = br::RenderPassBuilder::new()
+        let precompute_rp = br::RenderPassBuilder::new()
             .add_attachment(
                 br::AttachmentDescription::new(
                     br::vk::VK_FORMAT_R16G16B16A16_SFLOAT,
                     br::ImageLayout::Undefined,
                     br::ImageLayout::ShaderReadOnlyOpt,
                 )
-                .load_op(br::LoadOp::Clear)
+                .load_op(br::LoadOp::DontCare)
                 .store_op(br::StoreOp::Store),
             )
             .add_subpass(br::SubpassDescription::new().add_color_output(
@@ -2043,10 +2052,26 @@ where
                     &br::ComponentMapping::default(),
                     &br::ImageSubresourceRange::color(0..1, l..l + 1),
                 )?;
-                br::Framebuffer::new(&equirect_to_cubemap_rp, &[&iv], iv.size().as_ref(), 1)
+                br::Framebuffer::new(&precompute_rp, &[&iv], iv.size().as_ref(), 1)
             })
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to create equirect to cubemap frame buffer");
+        let irradiance_precompute_fbs = (0..6)
+            .map(|l| {
+                let iv = mem
+                    .dwts
+                    .get(mem.dwt_irradiance_cubemap)
+                    .underlying()
+                    .create_view(
+                        None,
+                        None,
+                        &br::ComponentMapping::default(),
+                        &br::ImageSubresourceRange::color(0..1, l..l + 1),
+                    )?;
+                br::Framebuffer::new(&precompute_rp, &[&iv], iv.size().as_ref(), 1)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Failed to create irradiance precompute frame buffer");
 
         let equirect_to_cubemap_shader = peridot_vertex_processing_pack::PvpShaderModules::new(
             e.graphics(),
@@ -2054,10 +2079,16 @@ where
                 .expect("Failed to load equirectangular to cubemap shader"),
         )
         .expect("Failed to create equirectangular to cubemap shader modules");
+        let irradiance_precompute_shader = PvpShaderModules::new(
+            e.graphics(),
+            e.load("shaders.irradiance_convolution")
+                .expect("Failed to load irradiance convolution shader"),
+        )
+        .expect("Failed to create irradiance convolution shader modules");
         let linear_smp = br::SamplerBuilder::default()
             .create(e.graphics())
             .expect("Failed to default sampler");
-        let dsl = br::DescriptorSetLayout::new(
+        let dsl = DetailedDescriptorSetLayout::new(
             e.graphics(),
             &[br::DescriptorSetLayoutBinding::CombinedImageSampler(
                 1,
@@ -2066,37 +2097,38 @@ where
             )],
         )
         .expect("Failed to create equirectangular to cubemap descriptor set layout");
-        let equirect_to_cubemap_pl = br::PipelineLayout::new(e.graphics(), &[&dsl], &[])
-            .expect("Failed to create equirectangular to cubemap pipeline layout");
-        let mut equirect_to_cubemap_dp = br::DescriptorPool::new(
-            e.graphics(),
-            1,
-            &[br::DescriptorPoolSize(
-                br::DescriptorType::CombinedImageSampler,
-                1,
-            )],
-            false,
-        )
-        .expect("Failed to create equirectangular to cubemap descriptor pool");
-        let equirect_to_cubemap_ds = equirect_to_cubemap_dp
-            .alloc(&[&dsl])
-            .expect("Failed to allocate descriptors");
+        let precompute_common_pl = br::PipelineLayout::new(e.graphics(), &[&dsl.object], &[])
+            .expect("Failed to create precompute common pipeline layout");
+        let precompute_ds = DescriptorStore::new(e.graphics(), &[&dsl, &dsl])
+            .expect("Failed to allocate equirectangular to cubemap descriptor sets");
         e.graphics().update_descriptor_sets(
-            &[br::DescriptorSetWriteInfo(
-                equirect_to_cubemap_ds[0].0,
-                0,
-                0,
-                br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
-                    None,
-                    tmp_loaded_image_view.native_ptr(),
-                    br::ImageLayout::ShaderReadOnlyOpt,
-                )]),
-            )],
+            &[
+                br::DescriptorSetWriteInfo(
+                    precompute_ds.descriptor(0).unwrap().into(),
+                    0,
+                    0,
+                    br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
+                        None,
+                        tmp_loaded_image_view.native_ptr(),
+                        br::ImageLayout::ShaderReadOnlyOpt,
+                    )]),
+                ),
+                br::DescriptorSetWriteInfo(
+                    precompute_ds.descriptor(1).unwrap().into(),
+                    0,
+                    0,
+                    br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
+                        None,
+                        mem.dwts.get(mem.dwt_ibl_cubemap).view().native_ptr(),
+                        br::ImageLayout::ShaderReadOnlyOpt,
+                    )]),
+                ),
+            ],
             &[],
         );
-        let mut equirect_to_cubemap_pipeline = br::GraphicsPipelineBuilder::new(
-            &equirect_to_cubemap_pl,
-            (&equirect_to_cubemap_rp, 0),
+        let mut precompute_pipeline = br::GraphicsPipelineBuilder::new(
+            &precompute_common_pl,
+            (&precompute_rp, 0),
             equirect_to_cubemap_shader.generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
         );
         let equirect_to_cubemap_render_rect = br::vk::VkRect2D {
@@ -2106,7 +2138,14 @@ where
                 height: 512,
             },
         };
-        equirect_to_cubemap_pipeline
+        let irradiance_precompute_render_rect = br::vk::VkRect2D {
+            offset: br::vk::VkOffset2D { x: 0, y: 0 },
+            extent: br::vk::VkExtent2D {
+                width: 32,
+                height: 32,
+            },
+        };
+        precompute_pipeline
             .viewport_scissors(
                 br::DynamicArrayState::Static(&[br::vk::VkViewport::from_rect_with_depth_range(
                     &equirect_to_cubemap_render_rect,
@@ -2116,9 +2155,24 @@ where
             )
             .add_attachment_blend(br::AttachmentColorBlendState::noblend())
             .multisample_state(Some(br::MultisampleState::new()));
-        let equirect_to_cubemap_pipeline = equirect_to_cubemap_pipeline
+        let equirect_to_cubemap_pipeline = precompute_pipeline
             .create(e.graphics(), None)
             .expect("Failed to create equirectangular to cubemap pipeline");
+        precompute_pipeline
+            .viewport_scissors(
+                br::DynamicArrayState::Static(&[br::vk::VkViewport::from_rect_with_depth_range(
+                    &irradiance_precompute_render_rect,
+                    0.0..1.0,
+                )]),
+                br::DynamicArrayState::Static(&[irradiance_precompute_render_rect.clone()]),
+            )
+            .vertex_processing(
+                irradiance_precompute_shader
+                    .generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
+            );
+        let irradiance_precompute_pipeline = precompute_pipeline
+            .create(e.graphics(), None)
+            .expect("Failed to create irradiance precompute pipeline");
 
         e.submit_commands(|r| {
             tfb.sink_transfer_commands(r);
@@ -2145,16 +2199,45 @@ where
             // multiview拡張とかつかうとbegin_render_pass一回にできるけど面倒なので適当にやる
             for (n, fb) in equirect_to_cubemap_fbs.iter().enumerate() {
                 r.begin_render_pass(
-                    &equirect_to_cubemap_rp,
-                    &fb,
+                    &precompute_rp,
+                    fb,
                     equirect_to_cubemap_render_rect.clone(),
-                    &[br::ClearValue::color_f32([0.0; 4])],
+                    &[],
                     true,
                 )
-                .bind_graphics_pipeline_pair(&equirect_to_cubemap_pipeline, &equirect_to_cubemap_pl)
+                .bind_graphics_pipeline_pair(&equirect_to_cubemap_pipeline, &precompute_common_pl)
                 .bind_graphics_descriptor_sets(
                     0,
-                    unsafe { std::mem::transmute(&equirect_to_cubemap_ds[..]) },
+                    &[precompute_ds.descriptor(0).unwrap().into()],
+                    &[],
+                )
+                .bind_vertex_buffers(
+                    0,
+                    &[
+                        (&buffer, fillrect_offset as _),
+                        (
+                            &buffer,
+                            cube_ref_positions_offset as usize
+                                + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
+                        ),
+                    ],
+                )
+                .draw(4, 1, 0, 0)
+                .end_render_pass();
+            }
+
+            for (n, fb) in irradiance_precompute_fbs.iter().enumerate() {
+                r.begin_render_pass(
+                    &precompute_rp,
+                    fb,
+                    irradiance_precompute_render_rect.clone(),
+                    &[],
+                    true,
+                )
+                .bind_graphics_pipeline_pair(&irradiance_precompute_pipeline, &precompute_common_pl)
+                .bind_graphics_descriptor_sets(
+                    0,
+                    &[precompute_ds.descriptor(1).unwrap().into()],
                     &[],
                 )
                 .bind_vertex_buffers(
@@ -2176,6 +2259,7 @@ where
         // keep alice resources while command execution
         drop(tmp_loaded_image_mem);
         drop(buffer);
+        drop(irradiance_precompute_fbs);
         drop(equirect_to_cubemap_fbs);
         drop(tmp_loaded_image_view);
 
@@ -2191,6 +2275,7 @@ where
                 &const_res.dsl_utb1,
                 &const_res.dsl_ub1,
                 &const_res.dsl_ub1,
+                &const_res.dsl_ics1_f,
                 &const_res.dsl_ics1_f,
             ],
         )
@@ -2282,6 +2367,15 @@ where
                 br::ImageLayout::ShaderReadOnlyOpt,
             )]),
         );
+        dub.write(
+            descriptors.descriptor(10).unwrap(),
+            0,
+            br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
+                None,
+                mem.dwts.get(mem.dwt_irradiance_cubemap).view().native_ptr(),
+                br::ImageLayout::ShaderReadOnlyOpt,
+            )]),
+        );
         dub.submit(e.graphics_device());
 
         let screen_res = ScreenResources::new(e, &const_res);
@@ -2342,6 +2436,7 @@ where
                         descriptors.descriptor(1).unwrap(),
                         descriptors.descriptor(2).unwrap(),
                         descriptors.descriptor(3).unwrap(),
+                        descriptors.descriptor(10).unwrap(),
                     );
                 }
             });
@@ -2605,7 +2700,8 @@ where
             .reset()
             .expect("Failed to reset screen commands");
         for rb in &mut self.render_bundles {
-            rb.reset().expect("Failed to reset individual render bundles");
+            rb.reset()
+                .expect("Failed to reset individual render bundles");
         }
         self.screen_res.frame_buffers.clear();
     }
@@ -2662,6 +2758,7 @@ where
                         self.descriptors.descriptor(1).unwrap(),
                         self.descriptors.descriptor(2).unwrap(),
                         self.descriptors.descriptor(3).unwrap(),
+                        self.descriptors.descriptor(10).unwrap(),
                     );
                 }
             });
@@ -2814,6 +2911,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
         object_transform_desc: br::DescriptorSet,
         rasterization_scene_info_desc: br::DescriptorSet,
         material_info_desc: br::DescriptorSet,
+        precomputed_map_desc: br::DescriptorSet,
     ) {
         let mut rec = command_buffer
             .begin_inherit(
@@ -2833,6 +2931,7 @@ impl<NL: peridot::NativeLinker> Game<NL> {
                 object_transform_desc.into(),
                 rasterization_scene_info_desc.into(),
                 material_info_desc.into(),
+                precomputed_map_desc.into(),
             ],
             &[],
         );

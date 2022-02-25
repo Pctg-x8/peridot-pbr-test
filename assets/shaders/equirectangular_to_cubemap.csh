@@ -15,7 +15,7 @@ Varyings VertexShader -> FragmentShader {
 Header[FragmentShader] {
     const vec2 invAtan = vec2(0.1591, 0.3183);
     vec2 sampleSphericalMap(vec3 v) {
-        return vec2(atan(v.z, v.x), asin(v.y)) * invAtan + 0.5;
+        return vec2(atan(v.z, v.x), -asin(v.y)) * invAtan + 0.5;
     }
 }
 FragmentShader {
