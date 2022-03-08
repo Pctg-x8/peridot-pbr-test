@@ -17,6 +17,7 @@ use self::staging::DynamicStagingBuffer;
 pub struct ObjectTransform {
     mvp: peridot::math::Matrix4F32,
     model_transform: peridot::math::Matrix4F32,
+    view_projection: peridot::math::Matrix4F32,
 }
 #[repr(C)]
 pub struct RasterizationCameraInfo {
@@ -24,6 +25,7 @@ pub struct RasterizationCameraInfo {
 }
 #[repr(C)]
 pub struct RasterizationDirectionalLightInfo {
+    /// 原点から見たライトの向き（ライト本体の向きではない）
     dir: peridot::math::Vector4F32,
     intensity: peridot::math::Vector4F32,
 }
@@ -910,6 +912,7 @@ impl Memory {
             ObjectTransform {
                 mvp: camera_matrix,
                 model_transform: peridot::math::Matrix4::ONE,
+                view_projection: camera.view_matrix(),
             },
         ));
         self.update_sets.camera_vp_separated_offset = Some(
@@ -1853,7 +1856,7 @@ where
         mem.set_directional_light_info(
             e.graphics_mut(),
             RasterizationDirectionalLightInfo {
-                dir: -peridot::math::Vector4(0.2f32, 0.3, 0.5, 0.0).normalize(),
+                dir: peridot::math::Vector4(0.2f32, 0.3, -0.5, 0.0).normalize(),
                 intensity: peridot::math::Vector4(2.0, 2.0, 2.0, 1.0),
             },
         );
@@ -2596,6 +2599,17 @@ where
                 &self.main_camera.camera.get().0,
                 self.main_camera.camera.get().1,
             );
+            self.mem.set_camera_info(
+                e.graphics_mut(),
+                RasterizationCameraInfo {
+                    pos: peridot::math::Vector4(
+                        self.main_camera.camera.get().0.position.0,
+                        self.main_camera.camera.get().0.position.1,
+                        self.main_camera.camera.get().0.position.2,
+                        1.0,
+                    ),
+                },
+            )
         }
 
         if self.material_data.take_dirty_flag() {
