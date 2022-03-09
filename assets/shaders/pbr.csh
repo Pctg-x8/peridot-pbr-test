@@ -14,7 +14,7 @@ Header[FragmentShader] {
 
     // Subset of Disney Principled BRDF Functions
     float DistributionGGXAnisotropic(vec3 h) {
-        const vec2 alpha = max(vec2(0.001, 0.001), vec2(pow(roughness, 2.0) * (1.0 + anisotropic), pow(roughness, 2.0) * (1.0 - anisotropic)));
+        /*const vec2 alpha = max(vec2(0.001, 0.001), vec2(pow(roughness, 2.0) * (1.0 + anisotropic), pow(roughness, 2.0) * (1.0 - anisotropic)));
         const float th = dot(tangent_v, h);
         const float bh = dot(binormal_v, h);
         const float nh = clamp(dot(normal_v, h), 0.0, 1.0);
@@ -23,7 +23,7 @@ Header[FragmentShader] {
         const float v2 = dot(v, v);
         const float w2 = a2 / v2;
 
-        return a2 * w2 * w2 / PI;
+        return a2 * w2 * w2 / PI;*/
         /*const float th2 = pow(abs(dot(tangent_v, h)), 2.0);
         const float bh2 = pow(abs(dot(binormal_v, h)), 2.0);
         const float nm2 = pow(abs(dot(normal_v, h)), 2.0);
@@ -31,18 +31,25 @@ Header[FragmentShader] {
         const float denom = PI * alpha.x * alpha.y * pow(denom1, 2.0);
 
         return 1.0 / denom;*/
+
+        const float a = roughness * roughness;
+        // (nh^2 * a^2 - nh^2 + 1) ^ 2
+        const float nh2 = pow(abs(dot(normal_v, h)), 2.0);
+        const float w = a / (nh2 * a * a - nh2 + 1);
+
+        return w * w / PI;
     }
 
     // Smiths method with GGX
     float GeometryVisibility(vec3 light, vec3 outDir) {
         const float a = roughness * roughness;
-        const float a2 = pow(a, 2.0);
+        const float a2 = a * a;
         const float nl = clamp(dot(normal_v, light), 0.0, 1.0);
         const float nv = abs(dot(normal_v, outDir)) + 1e-5;
-        const float denomLight = (nl + sqrt(a2 + pow(nl, 2.0) - pow(nl * a, 2.0)));
-        const float denomView = (nv + sqrt(a2 + pow(nv, 2.0) - pow(nv * a, 2.0)));
+        const float denomLight = nl * sqrt(nv * nv * (1.0 - a2) + a2);
+        const float denomView = nv * sqrt(nl * nl * (1.0 - a2) + a2);
 
-        return 1.0 / (denomLight * denomView);
+        return 0.5 / max(denomLight + denomView, 1e-6);
     }
 
     // Schlicks approximation method
@@ -54,13 +61,13 @@ Header[FragmentShader] {
         const vec3 f0 = 0.16 * reflectance * reflectance * (1.0 - metallic) + albedo * metallic;
         const float u = clamp(dot(lightDir.xyz, h), 0.0, 1.0);
 
-        return f0 + (1.0 - f0) * pow(1.0 - u, 5.0);
+        return Fresnel1(f0, 1.0, u);
     }
 
     vec3 SpecularBRDF(vec3 light, vec3 outDir, vec3 albedo) {
-        const vec3 h = normalize(light + outDir);
+        const vec3 h = normalize(outDir + light);
 
-        return DistributionGGXAnisotropic(h) * GeometryVisibility(light, outDir) * Fresnel(outDir, h, albedo);
+        return vec3(DistributionGGXAnisotropic(h) * GeometryVisibility(light, outDir)) * Fresnel(outDir, h, albedo);
     }
 
     // Simple Lambert approximation
@@ -86,10 +93,9 @@ Header[FragmentShader] {
         const float ndl = dot(normal_v, lightDir.xyz);
         const float ldh = dot(lightDir.xyz, h);
         const vec3 albedo = baseColor.xyz;
-        const vec3 ks = Fresnel(outDir, h, albedo);
-        const vec3 kd = (vec3(1.0) - ks) * (1.0 - metallic);
-        const vec3 diffuse = DiffuseBRDF(ndv, ndl, ldh, roughness, albedo);
-        const vec3 brdf = (diffuse + SpecularBRDF(normalize(lightDir.xyz), outDir, albedo)) * lightIntensity.xyz * dot(normal_v, lightDir.xyz);
+        const vec3 kd = (1.0 - Fresnel(outDir, h, albedo)) * (1.0 - metallic);
+        const vec3 diffuse = DiffuseBRDF(ndv, clamp(ndl, 0.0, 1.0), ldh, roughness, albedo);
+        const vec3 brdf = (diffuse * kd + SpecularBRDF(normalize(lightDir.xyz), outDir, albedo)) * lightIntensity.xyz * dot(normal_v, lightDir.xyz);
         // const vec3 brdf = DiffuseBRDF(albedo);
 
         return brdf;
@@ -100,7 +106,7 @@ Header[FragmentShader] {
     }
 }
 FragmentShader {
-    const vec3 outDir = normalize((cameraPos - worldPos).xyz);
+    const vec3 outDir = normalize(cameraPos.xyz - worldPos.xyz);
     Target[0] = vec4(CalcImageLightReflectIntensity(outDir) + CalcDirectionalLightReflectIntensity(outDir), 1.0) * baseColor.a;
 }
 
