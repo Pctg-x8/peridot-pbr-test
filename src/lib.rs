@@ -1694,10 +1694,6 @@ pub struct Game<NL: peridot::NativeLinker> {
     last_frame_tfb: peridot::TransferBatch,
     ph: std::marker::PhantomData<*const NL>,
 }
-impl<NL: peridot::NativeLinker> Game<NL> {
-    pub const NAME: &'static str = "PBR test";
-    pub const VERSION: (u32, u32, u32) = (0, 1, 0);
-}
 impl<NL: peridot::NativeLinker> peridot::FeatureRequests for Game<NL> {}
 impl<NL: peridot::NativeLinker + Sync> peridot::EngineEvents<NL> for Game<NL>
 where

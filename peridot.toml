@@ -1,0 +1,4 @@
+app_package_id = "io.ct2.peridot.ext.pbr"
+title = "Peridot PBR Test"
+asset_dir = "./assets"
+engine_features = ["mt"]
