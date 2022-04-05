@@ -206,7 +206,7 @@ impl DynamicStagingBuffer {
         &mut self,
         e: &mut peridot::Graphics,
         length: usize,
-        mut ctor: impl FnMut(&mut [T]),
+        ctor: impl FnOnce(&mut [T]),
     ) -> u64 {
         let size = std::mem::size_of::<T>() * length;
         if self.top + size as u64 > self.cap {
