@@ -25,7 +25,7 @@ pub struct RasterizationCameraInfo {
 }
 #[repr(C)]
 pub struct RasterizationDirectionalLightInfo {
-    /// 原点から見たライトの向き（ライト本体の向きではない）
+    /// 原点から見た光源の方向（ライト本体の向きとは逆）
     dir: peridot::math::Vector4F32,
     intensity: peridot::math::Vector4F32,
 }

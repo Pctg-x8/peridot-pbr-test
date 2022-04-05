@@ -4,17 +4,19 @@ VertexInput {
 VertexShader {
     worldPos = transpose(modelTransform) * pos;
     RasterPosition = transpose(mvp) * pos;
-    normal_v = normalize((transpose(modelTransform) * normal).xyz);
-    tangent_v = normalize((transpose(modelTransform) * tangent).xyz);
-    binormal_v = normalize((transpose(modelTransform) * binormal).xyz);
+    normal_v = normalize(mat3(transpose(modelTransform)) * normal.xyz);
+    tangent_v = normalize(mat3(transpose(modelTransform)) * tangent.xyz);
+    binormal_v = normalize(mat3(transpose(modelTransform)) * binormal.xyz);
 }
 
 Header[FragmentShader] {
-    const float PI = 3.1415926;
+    const float PI = 3.1415926f;
 
     // Subset of Disney Principled BRDF Functions
     float DistributionGGXAnisotropic(vec3 h) {
-        /*const vec2 alpha = max(vec2(0.001, 0.001), vec2(pow(roughness, 2.0) * (1.0 + anisotropic), pow(roughness, 2.0) * (1.0 - anisotropic)));
+        const vec2 alpha = max(vec2(0.001, 0.001), vec2(pow(roughness, 2.0) * (1.0 + anisotropic), pow(roughness, 2.0) * (1.0 - anisotropic)));
+
+        /*
         const float th = dot(tangent_v, h);
         const float bh = dot(binormal_v, h);
         const float nh = clamp(dot(normal_v, h), 0.0, 1.0);
@@ -24,20 +26,48 @@ Header[FragmentShader] {
         const float w2 = a2 / v2;
 
         return a2 * w2 * w2 / PI;*/
-        /*const float th2 = pow(abs(dot(tangent_v, h)), 2.0);
+
+        // GGX Anisotropic Model
+        const float th2 = pow(abs(dot(tangent_v, h)), 2.0);
         const float bh2 = pow(abs(dot(binormal_v, h)), 2.0);
         const float nm2 = pow(abs(dot(normal_v, h)), 2.0);
         const float denom1 = (th2 / pow(alpha.x, 2.0)) + (bh2 / pow(alpha.y, 2.0)) + nm2;
-        const float denom = PI * alpha.x * alpha.y * pow(denom1, 2.0);
+        const float denom = PI * alpha.x * alpha.y * denom1 * denom1;
 
-        return 1.0 / denom;*/
+        return 1.0 / denom;
 
-        const float a = roughness * roughness;
+        /*const float a = roughness * roughness;
         // (nh^2 * a^2 - nh^2 + 1) ^ 2
         const float nh2 = pow(abs(dot(normal_v, h)), 2.0);
         const float w = a / (nh2 * a * a - nh2 + 1);
 
-        return w * w / PI;
+        return w * w / PI;*/
+
+        /*// ellipsoid ndf: http://www.flycooler.com/download/SupplementalEllipsoidNDF.pdf
+        const vec2 alpha = max(vec2(0.001f, 0.001f), vec2(pow(roughness, 2.0f) * (1.0f + anisotropic), pow(roughness, 2.0f) * (1.0f - anisotropic)));
+        const mat3 a = mat3(alpha.x, 0.0f, 0.0f, 0.0f, alpha.y, 0.0f, 0.0f, 0.0f, 1.0f);
+        const float detA = alpha.x * alpha.y;
+        const float an = length(a * normal_v);
+        const vec3 athV = inverse(transpose(a)) * h;
+        const float ath2 = dot(athV, athV);
+
+        const float nh = dot(h, normal_v);
+
+        return (nh >= 0.0f ? 1.0f : 0.0f) / (PI * detA * an * ath2 * ath2);*/
+    }
+
+    float GeometryMasking1(vec3 u, vec3 m) {
+        const vec2 alpha = max(vec2(0.001, 0.001), vec2(pow(roughness, 2.0) * (1.0 + anisotropic), pow(roughness, 2.0) * (1.0 - anisotropic)));
+        const mat3 a = mat3(alpha.x, 0.0f, 0.0f, 0.0f, alpha.y, 0.0f, 0.0f, 0.0f, 1.0f);
+
+        const vec3 anV = a * normal_v;
+        const vec3 auV = a * u;
+
+        return min(1.0f, 2.0f * dot(anV, anV) * abs(dot(u, normal_v)) / (length(auV) * length(anV) + dot(auV, anV))) * (dot(u, m) >= 0.0f ? 1.0f : 0.0f);
+    }
+    float GeometryMasking(vec3 light, vec3 outDir) {
+        const vec3 h = normalize(light + outDir);
+        return GeometryMasking1(light, h) * GeometryMasking1(outDir, h);
     }
 
     // Smiths method with GGX
@@ -65,7 +95,8 @@ Header[FragmentShader] {
     }
 
     vec3 SpecularBRDF(vec3 light, vec3 outDir, vec3 albedo) {
-        const vec3 h = normalize(outDir + light);
+        const vec3 h = normalize(outDir + light * vec3(1.0, -1.0, 1.0));
+        const float denom = 4.0f * abs(dot(light, normal_v)) * abs(dot(outDir, normal_v));
 
         return vec3(DistributionGGXAnisotropic(h) * GeometryVisibility(light, outDir)) * Fresnel(outDir, h, albedo);
     }
@@ -108,6 +139,7 @@ Header[FragmentShader] {
 FragmentShader {
     const vec3 outDir = normalize(cameraPos.xyz - worldPos.xyz);
     Target[0] = vec4(CalcImageLightReflectIntensity(outDir) + CalcDirectionalLightReflectIntensity(outDir), 1.0) * baseColor.a;
+    // Target[0] = vec4(normalize(outDir + lightDir.xyz) * 0.5f + 0.5f, 1.0f);
 }
 
 Varyings VertexShader -> FragmentShader {
