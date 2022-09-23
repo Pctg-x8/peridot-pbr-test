@@ -18,3 +18,5 @@ peridot-image = { path = "../peridot/image" }
 euclid = "0.19"
 rayon = "1.5"
 half = "1.8"
+async-std = "1.7"
+futures-util = "0.3"

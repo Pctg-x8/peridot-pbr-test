@@ -768,6 +768,9 @@ impl UpdateSets {
     }
 }
 
+const PREFILTERED_ENVMAP_MIP_LEVELS: u32 = 5;
+const PREFILTERED_ENVMAP_SIZE: u32 = 128;
+
 pub struct Memory {
     mem: peridot::FixedMemory,
     static_offsets: StaticBufferOffsets,
@@ -782,6 +785,7 @@ pub struct Memory {
     dwts: peridot::DeviceWorkingTextureStore,
     dwt_ibl_cubemap: peridot::DeviceWorkingCubeTextureRef,
     dwt_irradiance_cubemap: peridot::DeviceWorkingCubeTextureRef,
+    dwt_prefiltered_envmap: peridot::DeviceWorkingCubeTextureRef,
 }
 impl Memory {
     pub fn new(
@@ -871,6 +875,12 @@ impl Memory {
             peridot::PixelFormat::RGBA64F,
             br::ImageUsage::COLOR_ATTACHMENT.sampled(),
         );
+        let dwt_prefiltered_envmap = dwt.new_cube_mipmapped(
+            peridot::math::Vector2(PREFILTERED_ENVMAP_SIZE, PREFILTERED_ENVMAP_SIZE),
+            peridot::PixelFormat::RGBA64F,
+            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+            PREFILTERED_ENVMAP_MIP_LEVELS,
+        );
         let dwts = dwt.alloc(e.graphics()).expect("Failed to allocate dwts");
 
         Self {
@@ -902,6 +912,7 @@ impl Memory {
             dwts,
             dwt_ibl_cubemap,
             dwt_irradiance_cubemap,
+            dwt_prefiltered_envmap,
         }
     }
 
@@ -1764,6 +1775,31 @@ where
             })
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to create irradiance precompute frame buffer");
+        let prefiltered_envmap_fbs = (0..6)
+            .flat_map(|d| (0..PREFILTERED_ENVMAP_MIP_LEVELS).map(move |ml| (d, ml)))
+            .map(|(d, ml)| {
+                let iv = mem
+                    .dwts
+                    .get(mem.dwt_prefiltered_envmap)
+                    .underlying()
+                    .create_view(
+                        None,
+                        None,
+                        &br::ComponentMapping::default(),
+                        &br::ImageSubresourceRange::color(ml..ml + 1, d..d + 1),
+                    )?;
+                br::Framebuffer::new(
+                    &precompute_rp,
+                    &[&iv],
+                    &br::vk::VkExtent2D {
+                        width: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _)) as _,
+                        height: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _)) as _,
+                    },
+                    1,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Failed to create prefiltered envmap frame buffer");
 
         let equirect_to_cubemap_shader = peridot_vertex_processing_pack::PvpShaderModules::new(
             e.graphics(),
@@ -1777,6 +1813,12 @@ where
                 .expect("Failed to load irradiance convolution shader"),
         )
         .expect("Failed to create irradiance convolution shader modules");
+        let prefilter_envmap_shader = PvpShaderModules::new(
+            e.graphics(),
+            e.load("shaders.prefilter_env")
+                .expect("Failed to load envmap prefilter shader"),
+        )
+        .expect("Failed to create envmap prefilter shader modules");
         let linear_smp = br::SamplerBuilder::default()
             .create(e.graphics())
             .expect("Failed to default sampler");
@@ -1791,6 +1833,12 @@ where
         .expect("Failed to create equirectangular to cubemap descriptor set layout");
         let precompute_common_pl = br::PipelineLayout::new(e.graphics(), &[&dsl.object], &[])
             .expect("Failed to create precompute common pipeline layout");
+        let prefilter_envmap_pl = br::PipelineLayout::new(
+            e.graphics(),
+            &[&dsl.object],
+            &[(br::ShaderStage::FRAGMENT, 0..4)],
+        )
+        .expect("Failed to create envmap prefilter pipeline layout");
         let precompute_ds = DescriptorStore::new(e.graphics(), &[&dsl, &dsl])
             .expect("Failed to allocate equirectangular to cubemap descriptor sets");
         e.graphics().update_descriptor_sets(
@@ -1865,92 +1913,172 @@ where
         let irradiance_precompute_pipeline = precompute_pipeline
             .create(e.graphics(), None)
             .expect("Failed to create irradiance precompute pipeline");
-
-        e.submit_commands(|r| {
-            tfb.sink_transfer_commands(r);
-            tfb.sink_graphics_ready_commands(r);
-
-            r.pipeline_barrier(
-                br::PipelineStageFlags::BOTTOM_OF_PIPE.host(),
-                br::PipelineStageFlags::VERTEX_INPUT.fragment_shader(),
-                false,
-                &[],
-                &[br::BufferMemoryBarrier::new(
-                    &buffer,
-                    0..buffer_data_size,
-                    br::AccessFlags::HOST.write,
-                    br::AccessFlags::VERTEX_ATTRIBUTE_READ,
-                )],
-                &[br::ImageMemoryBarrier::new(
-                    &br::ImageSubref::color(&tmp_loaded_image, 0..1, 0..1),
-                    br::ImageLayout::Preinitialized,
-                    br::ImageLayout::ShaderReadOnlyOpt,
-                )],
+        precompute_pipeline
+            .layout(&prefilter_envmap_pl)
+            .viewport_scissors(
+                br::DynamicArrayState::Dynamic(1),
+                br::DynamicArrayState::Dynamic(1),
+            )
+            .vertex_processing(
+                prefilter_envmap_shader.generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
             );
+        let envmap_prefilter_pipeline = precompute_pipeline
+            .create(e.graphics(), None)
+            .expect("Failed to create envmap prefilter pipeline");
 
-            // multiview拡張とかつかうとbegin_render_pass一回にできるけど面倒なので適当にやる
-            for (n, fb) in equirect_to_cubemap_fbs.iter().enumerate() {
-                r.begin_render_pass(
-                    &precompute_rp,
-                    fb,
-                    equirect_to_cubemap_render_rect.clone(),
-                    &[],
-                    true,
-                )
-                .bind_graphics_pipeline_pair(&equirect_to_cubemap_pipeline, &precompute_common_pl)
-                .bind_graphics_descriptor_sets(
-                    0,
-                    &[precompute_ds.descriptor(0).unwrap().into()],
-                    &[],
-                )
-                .bind_vertex_buffers(
-                    0,
-                    &[
-                        (&buffer, fillrect_offset as _),
-                        (
-                            &buffer,
-                            cube_ref_positions_offset as usize
-                                + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
-                        ),
-                    ],
-                )
-                .draw(4, 1, 0, 0)
-                .end_render_pass();
-            }
+        async_std::task::block_on(async {
+            e.submit_commands_async(|r| {
+                tfb.sink_transfer_commands(r);
+                tfb.sink_graphics_ready_commands(r);
 
-            for (n, fb) in irradiance_precompute_fbs.iter().enumerate() {
-                r.begin_render_pass(
-                    &precompute_rp,
-                    fb,
-                    irradiance_precompute_render_rect.clone(),
+                r.pipeline_barrier(
+                    br::PipelineStageFlags::BOTTOM_OF_PIPE.host(),
+                    br::PipelineStageFlags::VERTEX_INPUT.fragment_shader(),
+                    false,
                     &[],
-                    true,
-                )
-                .bind_graphics_pipeline_pair(&irradiance_precompute_pipeline, &precompute_common_pl)
-                .bind_graphics_descriptor_sets(
-                    0,
-                    &[precompute_ds.descriptor(1).unwrap().into()],
-                    &[],
-                )
-                .bind_vertex_buffers(
-                    0,
-                    &[
-                        (&buffer, fillrect_offset as _),
-                        (
-                            &buffer,
-                            cube_ref_positions_offset as usize
-                                + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
-                        ),
-                    ],
-                )
-                .draw(4, 1, 0, 0)
-                .end_render_pass();
-            }
-        })
-        .expect("Failed to initialize resources");
-        // keep alice resources while command execution
+                    &[br::BufferMemoryBarrier::new(
+                        &buffer,
+                        0..buffer_data_size,
+                        br::AccessFlags::HOST.write,
+                        br::AccessFlags::VERTEX_ATTRIBUTE_READ,
+                    )],
+                    &[br::ImageMemoryBarrier::new(
+                        &br::ImageSubref::color(&tmp_loaded_image, 0..1, 0..1),
+                        br::ImageLayout::Preinitialized,
+                        br::ImageLayout::ShaderReadOnlyOpt,
+                    )],
+                );
+
+                // multiview拡張とかつかうとbegin_render_pass一回にできるけど面倒なので適当にやる
+                r.bind_graphics_pipeline_pair(&equirect_to_cubemap_pipeline, &precompute_common_pl)
+                    .bind_graphics_descriptor_sets(
+                        0,
+                        &[precompute_ds.descriptor(0).unwrap().into()],
+                        &[],
+                    );
+                for (n, fb) in equirect_to_cubemap_fbs.iter().enumerate() {
+                    r.begin_render_pass(
+                        &precompute_rp,
+                        fb,
+                        equirect_to_cubemap_render_rect.clone(),
+                        &[],
+                        true,
+                    )
+                    .bind_vertex_buffers(
+                        0,
+                        &[
+                            (&buffer, fillrect_offset as _),
+                            (
+                                &buffer,
+                                cube_ref_positions_offset as usize
+                                    + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
+                            ),
+                        ],
+                    )
+                    .draw(4, 1, 0, 0)
+                    .end_render_pass();
+                }
+            })
+            .expect("Failed to submit initialize commands")
+            .await
+            .expect("Failed to initialize cubemap");
+
+            let irradiance_precompute_task = e
+                .submit_commands_async(|r| {
+                    r.bind_graphics_pipeline_pair(
+                        &irradiance_precompute_pipeline,
+                        &precompute_common_pl,
+                    )
+                    .bind_graphics_descriptor_sets(
+                        0,
+                        &[precompute_ds.descriptor(1).unwrap().into()],
+                        &[],
+                    );
+                    for (n, fb) in irradiance_precompute_fbs.iter().enumerate() {
+                        r.begin_render_pass(
+                            &precompute_rp,
+                            fb,
+                            irradiance_precompute_render_rect.clone(),
+                            &[],
+                            true,
+                        )
+                        .bind_vertex_buffers(
+                            0,
+                            &[
+                                (&buffer, fillrect_offset as _),
+                                (
+                                    &buffer,
+                                    cube_ref_positions_offset as usize
+                                        + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
+                                ),
+                            ],
+                        )
+                        .draw(4, 1, 0, 0)
+                        .end_render_pass();
+                    }
+                })
+                .expect("Failed to submit irradiance precompute commands");
+            let prefilter_envmap_task = e
+                .submit_commands_async(|r| {
+                    r.bind_graphics_pipeline_pair(&envmap_prefilter_pipeline, &prefilter_envmap_pl)
+                        .bind_graphics_descriptor_sets(
+                            0,
+                            &[precompute_ds.descriptor(1).unwrap().into()],
+                            &[],
+                        );
+                    for n in 0usize..6 {
+                        let target_framebuffers = &prefiltered_envmap_fbs[n
+                            * PREFILTERED_ENVMAP_MIP_LEVELS as usize
+                            ..(n + 1) * PREFILTERED_ENVMAP_MIP_LEVELS as usize];
+
+                        r.bind_vertex_buffers(
+                            0,
+                            &[
+                                (&buffer, fillrect_offset as _),
+                                (
+                                    &buffer,
+                                    cube_ref_positions_offset as usize
+                                        + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
+                                ),
+                            ],
+                        );
+                        for (ml, fb) in target_framebuffers.iter().enumerate() {
+                            let roughness =
+                                ml as f32 / (PREFILTERED_ENVMAP_MIP_LEVELS as f32 - 1.0);
+                            let region = br::vk::VkRect2D {
+                                offset: br::vk::VkOffset2D { x: 0, y: 0 },
+                                extent: br::vk::VkExtent2D {
+                                    width: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _))
+                                        as _,
+                                    height: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _))
+                                        as _,
+                                },
+                            };
+
+                            r.begin_render_pass(&precompute_rp, fb, region.clone(), &[], true)
+                                .set_viewport(
+                                    0,
+                                    &[br::vk::VkViewport::from_rect_with_depth_range(
+                                        &region,
+                                        0.0..1.0,
+                                    )],
+                                )
+                                .set_scissor(0, &[region])
+                                .push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &roughness)
+                                .draw(4, 1, 0, 0)
+                                .end_render_pass();
+                        }
+                    }
+                })
+                .expect("Failed to submit prefilter envmap commands");
+
+            let (a, b) = futures_util::join!(irradiance_precompute_task, prefilter_envmap_task);
+            a.or(b).expect("Failed to precompute envmaps");
+        });
+        // keep alive resources while command execution
         drop(tmp_loaded_image_mem);
         drop(buffer);
+        drop(prefiltered_envmap_fbs);
         drop(irradiance_precompute_fbs);
         drop(equirect_to_cubemap_fbs);
         drop(tmp_loaded_image_view);
