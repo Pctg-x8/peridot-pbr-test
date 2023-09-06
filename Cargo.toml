@@ -10,11 +10,17 @@ use-std-freetype = ["peridot-vg/use-freetype", "peridot-vg/use-fontconfig"]
 debug = ["peridot/debug"]
 
 [dependencies]
-peridot = { path = "../peridot", features = ["mt"] }
-bedrock = { git = "https://github.com/Pctg-x8/bedrock", branch = "peridot", features = ["Multithreaded"] }
-peridot-vertex-processing-pack = { path = "../peridot/vertex-processing-pack" }
-peridot-vg = { path = "../peridot/vg" }
-peridot-image = { path = "../peridot/image" }
+peridot = { path = "../peridot/base", features = ["mt"] }
+bedrock = { git = "https://github.com/Pctg-x8/bedrock", branch = "peridot", features = [
+    "Multithreaded",
+] }
+peridot-vertex-processing-pack = { path = "../peridot/modules/vertex-processing-pack" }
+peridot-vg = { path = "../peridot/modules/vg" }
+peridot-image = { path = "../peridot/modules/image" }
+peridot-command-object = { path = "../peridot/modules/command-object", features = [
+    "memory-manager-interop",
+] }
+peridot-memory-manager = { path = "../peridot/modules/memory-manager" }
 euclid = "0.19"
 rayon = "1.5"
 half = "1.8"

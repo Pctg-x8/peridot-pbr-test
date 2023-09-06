@@ -126,12 +126,12 @@ impl UnitIcosphere {
                 .chain(yz_planes.into_iter())
                 .map(|p| {
                     let n3 = peridot::math::Vector3::from(p.clone()).normalize();
-                    let ax = peridot::math::Vector3::UP.cross(&n3);
+                    let ax = peridot::math::Vector3::up().cross(&n3);
                     let q = peridot::math::Quaternion(
                         ax.0,
                         ax.1,
                         ax.2,
-                        1.0 + peridot::math::Vector3::UP.dot(n3.clone()),
+                        1.0 + peridot::math::Vector3::up().dot(n3.clone()),
                     )
                     .normalize();
                     let rot = peridot::math::Matrix4::from(q);
@@ -163,12 +163,12 @@ impl UnitIcosphere {
                 );
 
                 let n3 = peridot::math::Vector3::from(p.clone()).normalize();
-                let ax = peridot::math::Vector3::UP.cross(&n3);
+                let ax = peridot::math::Vector3::up().cross(&n3);
                 let q = peridot::math::Quaternion(
                     ax.0,
                     ax.1,
                     ax.2,
-                    1.0 + peridot::math::Vector3::UP.dot(n3.clone()),
+                    1.0 + peridot::math::Vector3::up().dot(n3.clone()),
                 )
                 .normalize();
                 let rot = peridot::math::Matrix4::from(q);

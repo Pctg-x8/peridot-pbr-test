@@ -1,12 +1,26 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use bedrock as br;
-use br::{MemoryBound, VkHandle};
+use br::{
+    Buffer, CommandBuffer, CommandPool, DescriptorPool, Device, DeviceMemory, Image, ImageChild,
+    ImageSubresourceSlice, MemoryBound, SubmissionBatch, VkHandle,
+};
 use peridot::math::One;
+use peridot::mthelper::{DynamicMutabilityProvider, SharedRef};
 use peridot::{self, DefaultRenderCommands, ModelData};
+use peridot_command_object::{
+    BeginRenderPass, BindGraphicsDescriptorSets, Blending, BufferUsage,
+    BufferUsageTransitionBarrier, ColorAttachmentBlending, CopyBuffer, DescriptorSets,
+    EndRenderPass, GraphicsCommand, GraphicsCommandCombiner, GraphicsCommandSubmission,
+    IndexedMesh, Mesh, NextSubpass, PipelineBarrier, PipelineBarrierEntry, PushConstant,
+    RangedBuffer, RangedImage, SimpleDraw, StandardIndexedMesh, StandardMesh,
+    ViewportWithScissorRect,
+};
+use peridot_memory_manager::MemoryManager;
 use peridot_vertex_processing_pack::*;
+use peridot_vg::{FontProvider, FontProviderConstruct};
 use ui::{
     UIRenderable, UIRenderingBuffers, UISlider, UIStaticLabel, UI_ANISOTROPIC_TOP, UI_LEFT_MARGIN,
     UI_METALLIC_TOP, UI_REFLECTANCE_TOP, UI_ROUGHNESS_TOP, UI_SLIDER_HEIGHT,
@@ -45,90 +59,57 @@ pub struct MaterialInfo {
 }
 
 pub struct DetailedDescriptorSetLayout {
-    pub object: br::DescriptorSetLayout,
-    pub pool_requirements: Vec<br::DescriptorPoolSize>,
+    pub object: br::DescriptorSetLayoutObject<peridot::DeviceObject>,
+    pub pool_requirements: Vec<br::vk::VkDescriptorPoolSize>,
 }
 impl DetailedDescriptorSetLayout {
     pub fn new(
         g: &peridot::Graphics,
-        bindings: &[br::DescriptorSetLayoutBinding],
+        bindings: Vec<br::DescriptorSetLayoutBinding>,
     ) -> br::Result<Self> {
-        let object = br::DescriptorSetLayout::new(g, bindings)?;
         let mut pool_requirements = BTreeMap::new();
-        for b in bindings {
-            let (ty, n) = match b {
-                br::DescriptorSetLayoutBinding::UniformBuffer(count, _) => {
-                    (br::DescriptorType::UniformBuffer, count)
-                }
-                br::DescriptorSetLayoutBinding::StorageBuffer(count, _) => {
-                    (br::DescriptorType::StorageBuffer, count)
-                }
-                br::DescriptorSetLayoutBinding::UniformTexelBuffer(count, _) => {
-                    (br::DescriptorType::UniformTexelBuffer, count)
-                }
-                br::DescriptorSetLayoutBinding::StorageTexelBuffer(count, _) => {
-                    (br::DescriptorType::StorageTexelBuffer, count)
-                }
-                br::DescriptorSetLayoutBinding::UniformBufferDynamic(count, _) => {
-                    (br::DescriptorType::UniformBufferDynamic, count)
-                }
-                br::DescriptorSetLayoutBinding::StorageBufferDynamic(count, _) => {
-                    (br::DescriptorType::StorageBufferDynamic, count)
-                }
-                br::DescriptorSetLayoutBinding::CombinedImageSampler(count, _, _) => {
-                    (br::DescriptorType::CombinedImageSampler, count)
-                }
-                br::DescriptorSetLayoutBinding::Sampler(count, _, _) => {
-                    (br::DescriptorType::Sampler, count)
-                }
-                br::DescriptorSetLayoutBinding::SampledImage(count, _) => {
-                    (br::DescriptorType::SampledImage, count)
-                }
-                br::DescriptorSetLayoutBinding::StorageImage(count, _) => {
-                    (br::DescriptorType::StorageImage, count)
-                }
-                br::DescriptorSetLayoutBinding::InputAttachment(count, _) => {
-                    (br::DescriptorType::InputAttachment, count)
-                }
-            };
-
-            *pool_requirements.entry(ty).or_insert(0) += n;
+        for b in bindings.iter() {
+            *pool_requirements.entry(b.ty).or_insert(0) += b.count;
         }
+        let object =
+            br::DescriptorSetLayoutBuilder::with_bindings(bindings).create(g.device().clone())?;
 
         Ok(Self {
             object,
             pool_requirements: pool_requirements
                 .into_iter()
-                .map(|(ty, n)| br::DescriptorPoolSize(ty, n))
+                .map(|(ty, n)| ty.with_count(n))
                 .collect(),
         })
     }
 }
 
 pub struct DescriptorStore {
-    _pool: br::DescriptorPool,
+    _pool: br::DescriptorPoolObject<peridot::DeviceObject>,
     descriptors: Vec<br::DescriptorSet>,
 }
 impl DescriptorStore {
-    pub fn new(
+    pub fn new<'a>(
         g: &peridot::Graphics,
-        layouts: &[&DetailedDescriptorSetLayout],
+        layouts: impl IntoIterator<Item = &'a DetailedDescriptorSetLayout>,
     ) -> br::Result<Self> {
-        let mut pool_sizes = BTreeMap::new();
-        for &br::DescriptorPoolSize(ty, n) in layouts.iter().flat_map(|l| &l.pool_requirements) {
-            *pool_sizes.entry(ty).or_insert(0) += n;
-        }
-        let mut dp = br::DescriptorPool::new(
-            g,
-            layouts.len() as _,
-            &pool_sizes
-                .into_iter()
-                .map(|(ty, n)| br::DescriptorPoolSize(ty, n))
-                .collect::<Vec<_>>(),
-            false,
-        )?;
+        let layouts = layouts.into_iter();
 
-        let descriptors = dp.alloc(&layouts.iter().map(|l| &l.object).collect::<Vec<_>>())?;
+        let mut pool_sizes = BTreeMap::new();
+        let mut objects = Vec::with_capacity(layouts.size_hint().0);
+        for l in layouts {
+            objects.push(&l.object);
+            for s in l.pool_requirements.iter() {
+                *pool_sizes
+                    .entry(unsafe { core::mem::transmute::<_, br::DescriptorType>(s._type) })
+                    .or_insert(0) += s.descriptorCount;
+            }
+        }
+
+        let mut dp = br::DescriptorPoolBuilder::new(objects.len() as _)
+            .reserve_all(pool_sizes.into_iter().map(|(ty, n)| ty.with_count(n)))
+            .create(g.device().clone())?;
+        let descriptors = dp.alloc(&objects)?;
 
         Ok(Self {
             _pool: dp,
@@ -136,59 +117,58 @@ impl DescriptorStore {
         })
     }
 
-    pub fn descriptor(&self, index: usize) -> Option<br::DescriptorSet> {
+    pub fn raw_descriptor(&self, index: usize) -> Option<br::DescriptorSet> {
         self.descriptors.get(index).copied()
+    }
+
+    pub fn descriptor(&self, index: usize) -> Option<br::DescriptorPointer> {
+        self.raw_descriptor(index)
+            .map(|d| br::DescriptorPointer::new(d.into(), 0))
     }
 }
 
 pub struct ConstResources {
-    render_pass: br::RenderPass,
+    render_pass: br::RenderPassObject<peridot::DeviceObject>,
     dsl_ub1: DetailedDescriptorSetLayout,
     dsl_ub1_f: DetailedDescriptorSetLayout,
     dsl_ub2_f: DetailedDescriptorSetLayout,
     dsl_utb1: DetailedDescriptorSetLayout,
     dsl_ics1_f: DetailedDescriptorSetLayout,
     #[allow(dead_code)]
-    linear_sampler: br::Sampler,
-    unlit_colored_shader: PvpShaderModules<'static>,
-    unlit_colored_pipeline_layout: Arc<br::PipelineLayout>,
-    pbr_shader: PvpShaderModules<'static>,
-    pbr_pipeline_layout: Arc<br::PipelineLayout>,
-    vg_interior_color_fixed_shader: PvpShaderModules<'static>,
-    vg_curve_color_fixed_shader: PvpShaderModules<'static>,
-    vg_pipeline_layout: Arc<br::PipelineLayout>,
-    unlit_colored_ext_shader: PvpShaderModules<'static>,
-    unlit_colored_ext_pipeline: Arc<br::PipelineLayout>,
-    skybox_shader: PvpShaderModules<'static>,
-    skybox_shader_layout: Arc<br::PipelineLayout>,
+    linear_sampler: br::SamplerObject<peridot::DeviceObject>,
+    unlit_colored_shader: PvpShaderModules<'static, peridot::DeviceObject>,
+    unlit_colored_pipeline_layout: Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    pbr_shader: PvpShaderModules<'static, peridot::DeviceObject>,
+    pbr_pipeline_layout: Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    vg_interior_color_fixed_shader: PvpShaderModules<'static, peridot::DeviceObject>,
+    vg_curve_color_fixed_shader: PvpShaderModules<'static, peridot::DeviceObject>,
+    vg_pipeline_layout: Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    unlit_colored_ext_shader: PvpShaderModules<'static, peridot::DeviceObject>,
+    unlit_colored_ext_pipeline: Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    skybox_shader: PvpShaderModules<'static, peridot::DeviceObject>,
+    skybox_shader_layout: Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
 }
 impl ConstResources {
     const RENDER_STENCIL_PREPASS: u32 = 0;
     const RENDER_MAIN_PASS: u32 = 1;
 
     pub fn new(e: &peridot::Engine<impl peridot::NativeLinker>) -> Self {
-        let main_attachment = br::AttachmentDescription::new(
-            e.backbuffer_format(),
-            e.requesting_backbuffer_layout().0,
-            e.requesting_backbuffer_layout().0,
-        )
-        .load_op(br::LoadOp::Clear)
-        .store_op(br::StoreOp::Store);
+        let main_attachment = e
+            .back_buffer_attachment_desc()
+            .color_memory_op(br::LoadOp::Clear, br::StoreOp::Store);
         let depth_attachment = br::AttachmentDescription::new(
             br::vk::VK_FORMAT_D24_UNORM_S8_UINT,
             br::ImageLayout::DepthStencilAttachmentOpt,
             br::ImageLayout::DepthStencilAttachmentOpt,
         )
         .load_op(br::LoadOp::Clear)
-        .store_op(br::StoreOp::DontCare)
-        .stencil_load_op(br::LoadOp::Clear)
-        .stencil_store_op(br::StoreOp::DontCare);
+        .stencil_load_op(br::LoadOp::Clear);
         let stencil_prepass = br::SubpassDescription::new()
             .depth_stencil(1, br::ImageLayout::DepthStencilAttachmentOpt);
         let main_pass = br::SubpassDescription::new()
             .add_color_output(0, br::ImageLayout::ColorAttachmentOpt, None)
             .depth_stencil(1, br::ImageLayout::DepthStencilAttachmentOpt);
-        let passdep = br::vk::VkSubpassDependency {
+        let pass_dep = br::vk::VkSubpassDependency {
             srcSubpass: br::vk::VK_SUBPASS_EXTERNAL,
             dstSubpass: 1,
             srcStageMask: br::PipelineStageFlags::TOP_OF_PIPE.0,
@@ -209,130 +189,129 @@ impl ConstResources {
         let render_pass = br::RenderPassBuilder::new()
             .add_attachments([main_attachment, depth_attachment])
             .add_subpasses([stencil_prepass, main_pass])
-            .add_dependencies([stencil_prepass_dep, passdep])
-            .create(e.graphics_device())
+            .add_dependencies([stencil_prepass_dep, pass_dep])
+            .create(e.graphics().device().clone())
             .expect("Failed to create render pass");
 
         let linear_sampler = br::SamplerBuilder::default()
-            .create(e.graphics())
+            .create(e.graphics().device().clone())
             .expect("Failed to create DefaultSampler");
         let dsl_ub1 = DetailedDescriptorSetLayout::new(
             e.graphics(),
-            &[br::DescriptorSetLayoutBinding::UniformBuffer(
-                1,
-                br::ShaderStage::VERTEX,
-            )],
+            vec![br::DescriptorType::UniformBuffer
+                .make_binding(1)
+                .only_for_vertex()],
         )
         .expect("Failed to create descriptor set layout");
         let dsl_ub1_f = DetailedDescriptorSetLayout::new(
             e.graphics(),
-            &[br::DescriptorSetLayoutBinding::UniformBuffer(
-                1,
-                br::ShaderStage::FRAGMENT,
-            )],
+            vec![br::DescriptorType::UniformBuffer
+                .make_binding(1)
+                .only_for_fragment()],
         )
         .expect("Failed to create ub1f descriptor set layout");
         let dsl_ub2_f = DetailedDescriptorSetLayout::new(
             e.graphics(),
-            &[
-                br::DescriptorSetLayoutBinding::UniformBuffer(1, br::ShaderStage::FRAGMENT),
-                br::DescriptorSetLayoutBinding::UniformBuffer(1, br::ShaderStage::FRAGMENT),
+            vec![
+                br::DescriptorType::UniformBuffer
+                    .make_binding(1)
+                    .only_for_fragment(),
+                br::DescriptorType::UniformBuffer
+                    .make_binding(1)
+                    .only_for_fragment(),
             ],
         )
         .expect("Failed to create ub2f descriptor set layout");
         let dsl_utb1 = DetailedDescriptorSetLayout::new(
             e.graphics(),
-            &[br::DescriptorSetLayoutBinding::UniformTexelBuffer(
-                1,
-                br::ShaderStage::VERTEX,
-            )],
+            vec![br::DescriptorType::UniformTexelBuffer
+                .make_binding(1)
+                .only_for_vertex()],
         )
         .expect("Failed to create utb1 descriptor set layout");
         let dsl_ics1_f = DetailedDescriptorSetLayout::new(
             e.graphics(),
-            &[br::DescriptorSetLayoutBinding::CombinedImageSampler(
-                1,
-                br::ShaderStage::FRAGMENT,
-                &[linear_sampler.native_ptr()],
-            )],
+            vec![br::DescriptorType::CombinedImageSampler
+                .make_binding(1)
+                .only_for_fragment()
+                .with_immutable_samplers(vec![br::SamplerObjectRef::new(&linear_sampler)])],
         )
-        .expect("Faield to create ics1_f descriptor set layout");
+        .expect("Failed to create ics1_f descriptor set layout");
 
         let unlit_colored_shader = PvpShaderModules::new(
-            e.graphics_device(),
+            e.graphics().device(),
             e.load("shaders.unlit_colored")
                 .expect("Failed to load unlit_colored shader"),
         )
         .expect("Failed to create shader modules");
         let unlit_colored_pipeline_layout =
-            br::PipelineLayout::new(e.graphics_device(), &[&dsl_ub1.object], &[])
+            br::PipelineLayoutBuilder::new(vec![&dsl_ub1.object], vec![])
+                .create(e.graphics().device().clone())
                 .expect("Failed to create unlit_colored pipeline layout")
                 .into();
 
         let pbr_shader = PvpShaderModules::new(
-            e.graphics_device(),
+            e.graphics().device(),
             e.load("shaders.pbr").expect("Failed to load pbr shader"),
         )
         .expect("Failed to create pbr shader modules");
-        let pbr_pipeline_layout = br::PipelineLayout::new(
-            e.graphics_device(),
-            &[
+        let pbr_pipeline_layout = br::PipelineLayoutBuilder::new(
+            vec![
                 &dsl_ub1.object,
                 &dsl_ub2_f.object,
                 &dsl_ub1_f.object,
                 &dsl_ics1_f.object,
             ],
-            &[],
+            vec![],
         )
+        .create(e.graphics().device().clone())
         .expect("Failed to create pbr pipeline layout")
         .into();
         let unlit_colored_ext_shader = PvpShaderModules::new(
-            e.graphics_device(),
+            e.graphics().device(),
             e.load("shaders.unlit_colored_ext")
                 .expect("Failed to load unlit_colored_ext shader"),
         )
         .expect("Failed to create unlit_colored_ext shader modules");
-        let unlit_colored_ext_pipeline = br::PipelineLayout::new(
-            e.graphics_device(),
-            &[&dsl_ub1.object],
-            &[(br::ShaderStage::FRAGMENT, 0..16)],
+        let unlit_colored_ext_pipeline = br::PipelineLayoutBuilder::new(
+            vec![&dsl_ub1.object],
+            vec![(br::ShaderStage::FRAGMENT, 0..16)],
         )
+        .create(e.graphics().device().clone())
         .expect("Failed to create unlit_colored_ext pipeline layout")
         .into();
 
         let vg_interior_color_fixed_shader = PvpShaderModules::new(
-            e.graphics_device(),
+            e.graphics().device(),
             e.load("shaders.vg.interiorColorFixed")
                 .expect("Failed to load vg interior color shader"),
         )
         .expect("Failed to create vg interior color shader modules");
         let vg_curve_color_fixed_shader = PvpShaderModules::new(
-            e.graphics_device(),
+            e.graphics().device(),
             e.load("shaders.vg.curveColorFixed")
                 .expect("Failed to load vg curve color shader"),
         )
         .expect("Failed to create vg curve color shader modules");
-        let vg_pipeline_layout = br::PipelineLayout::new(
-            e.graphics_device(),
-            &[&dsl_utb1.object],
-            &[(br::ShaderStage::VERTEX, 0..4 * 4)],
+        let vg_pipeline_layout = br::PipelineLayoutBuilder::new(
+            vec![&dsl_utb1.object],
+            vec![(br::ShaderStage::VERTEX, 0..4 * 4)],
         )
+        .create(e.graphics().device().clone())
         .expect("Failed to create vg pipeline layout")
         .into();
 
         let skybox_shader = PvpShaderModules::new(
-            e.graphics_device(),
+            e.graphics().device(),
             e.load("shaders.skybox")
                 .expect("Failed to load skybox shader"),
         )
         .expect("Failed to create skybox shader modules");
-        let skybox_shader_layout = br::PipelineLayout::new(
-            e.graphics_device(),
-            &[&dsl_ub1.object, &dsl_ics1_f.object],
-            &[],
-        )
-        .expect("Failed to create skybox pipeline layout")
-        .into();
+        let skybox_shader_layout =
+            br::PipelineLayoutBuilder::new(vec![&dsl_ub1.object, &dsl_ics1_f.object], vec![])
+                .create(e.graphics().device().clone())
+                .expect("Failed to create skybox pipeline layout")
+                .into();
 
         Self {
             render_pass,
@@ -358,100 +337,139 @@ impl ConstResources {
 }
 
 pub struct ScreenResources {
-    #[allow(dead_code)]
-    depth_texture: peridot::Image,
-    #[allow(dead_code)]
-    depth_texture_view: br::ImageView,
-    frame_buffers: Vec<br::Framebuffer>,
-    grid_render_pipeline: peridot::LayoutedPipeline,
-    pbr_pipeline: peridot::LayoutedPipeline,
-    vg_interior_pipeline: peridot::LayoutedPipeline,
-    vg_curve_pipeline: peridot::LayoutedPipeline,
-    vg_interior_inv_pipeline: peridot::LayoutedPipeline,
-    vg_curve_inv_pipeline: peridot::LayoutedPipeline,
-    vg_interior_mask_pipeline: peridot::LayoutedPipeline,
-    vg_curve_mask_pipeline: peridot::LayoutedPipeline,
-    ui_fill_rect_pipeline: peridot::LayoutedPipeline,
-    ui_border_line_pipeline: peridot::LayoutedPipeline,
-    skybox_render_pipeline: peridot::LayoutedPipeline,
+    frame_buffers: Vec<
+        br::FramebufferObject<
+            peridot::DeviceObject,
+            SharedRef<dyn br::ImageView<ConcreteDevice = peridot::DeviceObject> + Sync + Send>,
+        >,
+    >,
+    grid_render_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    pbr_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    vg_interior_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    vg_curve_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    vg_interior_inv_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    vg_curve_inv_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    vg_interior_mask_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    vg_curve_mask_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    ui_fill_rect_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    ui_border_line_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
+    skybox_render_pipeline: peridot::LayoutedPipeline<
+        br::PipelineObject<peridot::DeviceObject>,
+        Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
+    >,
 }
 impl ScreenResources {
-    pub fn new(
-        e: &mut peridot::Engine<impl peridot::NativeLinker>,
+    pub fn new<NL: peridot::NativeLinker>(
+        e: &mut peridot::Engine<NL>,
+        memory_manager: &mut MemoryManager,
         const_res: &ConstResources,
-    ) -> Self {
-        let bb0 = e.backbuffer(0).expect("no backbuffers?");
+    ) -> Self
+    where
+        <NL::Presenter as peridot::PlatformPresenter>::BackBuffer: Send + Sync,
+    {
+        let bb0 = e.back_buffer(0).expect("no backbuffers?");
 
-        let depth_image = br::ImageDesc::new(
-            AsRef::<br::vk::VkExtent2D>::as_ref(bb0.size()),
-            br::vk::VK_FORMAT_D24_UNORM_S8_UINT,
-            br::ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-            br::ImageLayout::Undefined,
-        )
-        .create(e.graphics_device())
-        .expect("Failed to create depth image object");
-        let mreq = depth_image.requirements();
-        let depth_mem = br::DeviceMemory::allocate(
-            e.graphics_device(),
-            mreq.size as _,
-            e.graphics()
-                .memory_type_manager
-                .device_local_index(mreq.memoryTypeBits)
-                .expect("No suitable memory for depth buffer")
-                .index(),
-        )
-        .expect("Failed to allocate depth buffer memory");
-        let depth_texture = peridot::Image::bound(depth_image, &Arc::new(depth_mem.into()), 0)
-            .expect("Failed to bind depth buffer memory");
-        let depth_texture_view = depth_texture
-            .create_view(
-                None,
-                None,
-                &br::ComponentMapping::default(),
-                &br::ImageSubresourceRange::depth_stencil(0..1, 0..1),
+        let depth_texture = memory_manager
+            .allocate_device_local_image(
+                e.graphics(),
+                br::ImageDesc::new(
+                    bb0.image().size().wh(),
+                    br::vk::VK_FORMAT_D24_UNORM_S8_UINT,
+                    br::ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                    br::ImageLayout::Undefined,
+                ),
             )
-            .expect("Failed to create depth buffer view");
-        e.submit_commands(|r| {
-            let image_barriers = [br::ImageMemoryBarrier::new_raw(
-                &depth_texture,
-                &br::ImageSubresourceRange::depth_stencil(0..1, 0..1),
-                br::ImageLayout::Undefined,
-                br::ImageLayout::DepthStencilAttachmentOpt,
-            )];
+            .expect("Failed to allocate depth texture");
+        let depth_texture_view = SharedRef::new(
+            depth_texture
+                .subresource_range(br::AspectMask::DEPTH.stencil(), 0..1, 0..1)
+                .view_builder()
+                .create()
+                .expect("Failed to create depth buffer view"),
+        );
+        {
+            let depth_texture = RangedImage::single_depth_stencil_plane(depth_texture_view.image());
 
-            r.pipeline_barrier(
-                br::PipelineStageFlags::TOP_OF_PIPE,
-                br::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-                true,
-                &[],
-                &[],
-                &image_barriers,
-            );
-        })
-        .expect("Failed to submit initial barrier");
+            PipelineBarrier::new()
+                .by_region()
+                .with_barrier(depth_texture.barrier(
+                    br::ImageLayout::Undefined,
+                    br::ImageLayout::DepthStencilAttachmentOpt,
+                ))
+                .submit(e)
+                .expect("Failed to submit initial barrier");
+        }
 
         let frame_buffers: Vec<_> = e
-            .iter_backbuffers()
+            .iter_back_buffers()
             .map(|b| {
-                br::Framebuffer::new(
-                    &const_res.render_pass,
-                    &[&b, &depth_texture_view],
-                    b.size().as_ref(),
-                    1,
-                )
-                .expect("Failed to create framebuffer")
+                e.graphics()
+                    .device()
+                    .clone()
+                    .new_framebuffer(
+                        &const_res.render_pass,
+                        vec![
+                            b.clone()
+                                as Arc<
+                                    dyn br::ImageView<ConcreteDevice = peridot::DeviceObject>
+                                        + Send
+                                        + Sync,
+                                >,
+                            depth_texture_view.clone(),
+                        ],
+                        b.image().size().as_ref(),
+                        1,
+                    )
+                    .expect("Failed to create framebuffer")
             })
             .collect();
 
-        let area = AsRef::<br::vk::VkExtent2D>::as_ref(bb0.size())
-            .clone()
-            .into_rect(br::vk::VkOffset2D { x: 0, y: 0 });
-        let viewport = br::vk::VkViewport::from_rect_with_depth_range(&area, 0.0..1.0);
+        let area = bb0.image().size().wh().into_rect(br::vk::VkOffset2D::ZERO);
+        let viewport = area.make_viewport(0.0..1.0);
 
         let unlit_colored_vps = const_res
             .unlit_colored_shader
             .generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
-        let mut pb = br::GraphicsPipelineBuilder::new(
+        let mut pb = br::GraphicsPipelineBuilder::<
+            _,
+            br::PipelineObject<peridot::DeviceObject>,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >::new(
             &const_res.unlit_colored_pipeline_layout,
             (&const_res.render_pass, 1),
             unlit_colored_vps,
@@ -464,9 +482,12 @@ impl ScreenResources {
         pb.multisample_state(Some(br::MultisampleState::new()));
         pb.depth_test_settings(Some(br::CompareOp::LessOrEqual), true);
         let grid_render_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create grid render pipeline"),
-            &const_res.unlit_colored_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create grid render pipeline"),
+            const_res.unlit_colored_pipeline_layout.clone(),
         );
 
         let pbr_vps = const_res
@@ -475,9 +496,12 @@ impl ScreenResources {
         pb.layout(&const_res.pbr_pipeline_layout)
             .vertex_processing(pbr_vps);
         let pbr_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create pbr pipeline"),
-            &const_res.pbr_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create pbr pipeline"),
+            const_res.pbr_pipeline_layout.clone(),
         );
 
         let stencil_simple_matching = br::vk::VkStencilOpState {
@@ -498,18 +522,24 @@ impl ScreenResources {
             .stencil_control_front(stencil_simple_matching.clone())
             .stencil_control_back(stencil_simple_matching);
         let ui_fill_rect_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create ui_fill_rect pipeline"),
-            &const_res.unlit_colored_ext_pipeline,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create ui_fill_rect pipeline"),
+            const_res.unlit_colored_ext_pipeline.clone(),
         );
         let ui_border_line_vps = const_res
             .unlit_colored_ext_shader
             .generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
         pb.vertex_processing(ui_border_line_vps);
         let ui_border_line_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create ui_border_line pipeline"),
-            &const_res.unlit_colored_ext_pipeline,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create ui_border_line pipeline"),
+            const_res.unlit_colored_ext_pipeline.clone(),
         );
 
         pb.stencil_test_enable(false);
@@ -542,43 +572,45 @@ impl ScreenResources {
         pb.layout(&const_res.vg_pipeline_layout);
         pb.vertex_processing(vg_interior_vps.clone());
         let vg_interior_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create vg interior pipeline"),
-            &const_res.vg_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create vg interior pipeline"),
+            const_res.vg_pipeline_layout.clone(),
         );
         pb.vertex_processing(vg_curve_vps.clone());
         let vg_curve_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create vg curve pipeline"),
-            &const_res.vg_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create vg curve pipeline"),
+            const_res.vg_pipeline_layout.clone(),
         );
 
-        pb.clear_attachment_blends();
-        let mut inv_blend = br::AttachmentColorBlendState::noblend();
-        inv_blend
-            .enable()
-            .color_blend(
-                br::BlendFactor::OneMinusDestColor,
-                br::BlendOp::Add,
-                br::BlendFactor::Zero,
-            )
-            .alpha_blend(
-                br::BlendFactor::Zero,
-                br::BlendOp::Add,
-                br::BlendFactor::One,
-            );
-        pb.add_attachment_blend(inv_blend);
+        let inv_blend = ColorAttachmentBlending::new(
+            Blending::source_only(br::BlendFactor::OneMinusDestColor),
+            Blending::STRAIGHT_DEST,
+        );
+        pb.set_attachment_blends(vec![inv_blend.into_vk()]);
         pb.vertex_processing(vg_interior_vps.clone());
         let vg_interior_inv_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create vg interior inv color pipeline"),
-            &const_res.vg_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create vg interior inv color pipeline"),
+            const_res.vg_pipeline_layout.clone(),
         );
         pb.vertex_processing(vg_curve_vps);
         let vg_curve_inv_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create vg curve inv color pipeline"),
-            &const_res.vg_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create vg curve inv color pipeline"),
+            const_res.vg_pipeline_layout.clone(),
         );
 
         let stencil_simple_write = br::vk::VkStencilOpState {
@@ -596,16 +628,22 @@ impl ScreenResources {
         pb.stencil_control_front(stencil_simple_write.clone());
         pb.stencil_control_back(stencil_simple_write);
         let vg_curve_mask_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create vg curve mask pipeline"),
-            &const_res.vg_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create vg curve mask pipeline"),
+            const_res.vg_pipeline_layout.clone(),
         );
         pb.layout(&const_res.vg_pipeline_layout);
         pb.vertex_processing(vg_interior_vps);
         let vg_interior_mask_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics_device(), None)
-                .expect("Failed to create vg interior pipeline"),
-            &const_res.vg_pipeline_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create vg interior pipeline"),
+            const_res.vg_pipeline_layout.clone(),
         );
 
         pb.stencil_test_enable(false);
@@ -617,18 +655,18 @@ impl ScreenResources {
                 .skybox_shader
                 .generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
         );
-        pb.clear_attachment_blends();
-        pb.add_attachment_blend(br::AttachmentColorBlendState::noblend().into());
+        pb.set_attachment_blends(vec![ColorAttachmentBlending::Disabled.into_vk()]);
         pb.depth_compare_op(br::CompareOp::LessOrEqual);
         let skybox_render_pipeline = peridot::LayoutedPipeline::combine(
-            pb.create(e.graphics(), None)
-                .expect("Failed to create skybox render pipeline"),
-            &const_res.skybox_shader_layout,
+            pb.create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create skybox render pipeline"),
+            const_res.skybox_shader_layout.clone(),
         );
 
         Self {
-            depth_texture,
-            depth_texture_view,
             frame_buffers,
             grid_render_pipeline,
             pbr_pipeline,
@@ -675,7 +713,10 @@ pub struct StaticBufferInitializer<'o> {
     ui_mask_render_params: Option<peridot_vg::RendererParams>,
 }
 impl peridot::FixedBufferInitializer for StaticBufferInitializer<'_> {
-    fn stage_data(&mut self, m: &br::MappedMemoryRange) {
+    fn stage_data(
+        &mut self,
+        m: &br::MappedMemoryRange<impl br::DeviceMemory + br::VkHandleMut + ?Sized>,
+    ) {
         unsafe {
             let grid_range = m.slice_mut::<[peridot::ColoredVertex; 2]>(
                 self.offsets.grid as _,
@@ -728,15 +769,20 @@ impl peridot::FixedBufferInitializer for StaticBufferInitializer<'_> {
         }
     }
 
-    fn buffer_graphics_ready(
+    fn buffer_graphics_ready<Device: br::Device + 'static>(
         &self,
         tfb: &mut peridot::TransferBatch,
-        buf: &peridot::Buffer,
+        buf: &Arc<
+            peridot::Buffer<
+                impl br::Buffer<ConcreteDevice = Device> + 'static,
+                impl br::DeviceMemory<ConcreteDevice = Device> + 'static,
+            >,
+        >,
         range: std::ops::Range<u64>,
     ) {
         tfb.add_buffer_graphics_ready(
             br::PipelineStageFlags::VERTEX_INPUT,
-            buf,
+            buf.clone(),
             self.offsets.grid..range.end,
             br::AccessFlags::VERTEX_ATTRIBUTE_READ,
         );
@@ -772,7 +818,14 @@ const PREFILTERED_ENVMAP_MIP_LEVELS: u32 = 5;
 const PREFILTERED_ENVMAP_SIZE: u32 = 128;
 
 pub struct Memory {
-    mem: peridot::FixedMemory,
+    manager: MemoryManager,
+    mem: peridot::FixedMemory<
+        peridot::DeviceObject,
+        peridot::Buffer<
+            br::BufferObject<peridot::DeviceObject>,
+            br::DeviceMemoryObject<peridot::DeviceObject>,
+        >,
+    >,
     static_offsets: StaticBufferOffsets,
     mutable_offsets: MutableBufferOffsets,
     dynamic_stg: DynamicStagingBuffer,
@@ -780,12 +833,25 @@ pub struct Memory {
     icosphere_vertex_count: usize,
     ui_render_params: peridot_vg::RendererParams,
     ui_mask_render_params: peridot_vg::RendererParams,
-    ui_transform_buffer_view: br::BufferView,
-    ui_mask_transform_buffer_view: br::BufferView,
-    dwts: peridot::DeviceWorkingTextureStore,
-    dwt_ibl_cubemap: peridot::DeviceWorkingCubeTextureRef,
-    dwt_irradiance_cubemap: peridot::DeviceWorkingCubeTextureRef,
-    dwt_prefiltered_envmap: peridot::DeviceWorkingCubeTextureRef,
+    ui_transform_buffer_view: br::BufferViewObject<
+        SharedRef<
+            peridot::Buffer<
+                br::BufferObject<peridot::DeviceObject>,
+                br::DeviceMemoryObject<peridot::DeviceObject>,
+            >,
+        >,
+    >,
+    ui_mask_transform_buffer_view: br::BufferViewObject<
+        SharedRef<
+            peridot::Buffer<
+                br::BufferObject<peridot::DeviceObject>,
+                br::DeviceMemoryObject<peridot::DeviceObject>,
+            >,
+        >,
+    >,
+    dwt_ibl_cubemap: br::ImageViewObject<peridot_memory_manager::Image>,
+    dwt_irradiance_cubemap: br::ImageViewObject<peridot_memory_manager::Image>,
+    dwt_prefiltered_envmap: peridot_memory_manager::Image,
 }
 impl Memory {
     pub fn new(
@@ -794,6 +860,8 @@ impl Memory {
         ui: &peridot_vg::Context,
         ui_mask: &peridot_vg::Context,
     ) -> Self {
+        let mut manager = MemoryManager::new(e.graphics());
+
         let icosphere = mesh::UnitIcosphere::base()
             .subdivide()
             .subdivide()
@@ -822,7 +890,7 @@ impl Memory {
             ui: ui.prealloc(&mut static_bp),
             ui_mask: ui_mask.prealloc(&mut static_bp),
         };
-        let textures = peridot::TextureInitializationGroup::new(e.graphics_device());
+        let textures = peridot::TextureInitializationGroup::new(e.graphics().device().clone());
         let mut mutable_bp = peridot::BufferPrealloc::new(e.graphics());
         let mutable_offsets = MutableBufferOffsets {
             grid_mvp: mutable_bp
@@ -864,29 +932,50 @@ impl Memory {
         let ui_render_params = initializer.ui_render_params.unwrap();
         let ui_mask_render_params = initializer.ui_mask_render_params.unwrap();
 
-        let mut dwt = peridot::DeviceWorkingTextureAllocator::new();
-        let dwt_ibl_cubemap = dwt.new_cube(
-            peridot::math::Vector2(512, 512),
-            peridot::PixelFormat::RGBA64F,
-            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
-        );
-        let dwt_irradiance_cubemap = dwt.new_cube(
-            peridot::math::Vector2(32, 32),
-            peridot::PixelFormat::RGBA64F,
-            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
-        );
-        let dwt_prefiltered_envmap = dwt.new_cube_mipmapped(
-            peridot::math::Vector2(PREFILTERED_ENVMAP_SIZE, PREFILTERED_ENVMAP_SIZE),
-            peridot::PixelFormat::RGBA64F,
-            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
-            PREFILTERED_ENVMAP_MIP_LEVELS,
-        );
-        let dwts = dwt.alloc(e.graphics()).expect("Failed to allocate dwts");
+        let dwts = manager
+            .allocate_multiple_device_local_images(
+                e.graphics(),
+                [
+                    br::ImageDesc::new(
+                        peridot::math::Vector2(512u32, 512),
+                        peridot::PixelFormat::RGBA64F as _,
+                        br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+                        br::ImageLayout::Undefined,
+                    )
+                    .flags(br::ImageFlags::CUBE_COMPATIBLE)
+                    .array_layers(6),
+                    br::ImageDesc::new(
+                        peridot::math::Vector2(32u32, 32),
+                        peridot::PixelFormat::RGBA64F as _,
+                        br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+                        br::ImageLayout::Undefined,
+                    )
+                    .flags(br::ImageFlags::CUBE_COMPATIBLE)
+                    .array_layers(6),
+                    br::ImageDesc::new(
+                        peridot::math::Vector2(PREFILTERED_ENVMAP_SIZE, PREFILTERED_ENVMAP_SIZE),
+                        peridot::PixelFormat::RGBA64F as _,
+                        br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+                        br::ImageLayout::Undefined,
+                    )
+                    .flags(br::ImageFlags::CUBE_COMPATIBLE)
+                    .array_layers(6)
+                    .mip_levels(PREFILTERED_ENVMAP_MIP_LEVELS),
+                ],
+            )
+            .expect("Failed to allocate dwts");
+        let Ok::<[_; 3], _>([dwt_ibl_cubemap, dwt_irradiance_cubemap, dwt_prefiltered_envmap]) = dwts.try_into() else {
+            unreachable!("unknown combination");
+        };
 
         Self {
+            dynamic_stg: DynamicStagingBuffer::new(e.graphics(), &mut manager)
+                .expect("Failed to create dynamic staging buffer"),
+            manager,
             ui_transform_buffer_view: mem
                 .buffer
-                .0
+                .object
+                .clone()
                 .create_view(
                     br::vk::VK_FORMAT_R32G32B32A32_SFLOAT,
                     ui_render_params.transforms_byterange(),
@@ -894,7 +983,8 @@ impl Memory {
                 .expect("Failed to create buffer view of transforms"),
             ui_mask_transform_buffer_view: mem
                 .buffer
-                .0
+                .object
+                .clone()
                 .create_view(
                     br::vk::VK_FORMAT_R32G32B32A32_SFLOAT,
                     ui_mask_render_params.transforms_byterange(),
@@ -905,72 +995,100 @@ impl Memory {
             ui_mask_render_params,
             static_offsets: offsets,
             mutable_offsets,
-            dynamic_stg: DynamicStagingBuffer::new(e.graphics())
-                .expect("Failed to create dynamic staging buffer"),
             update_sets: UpdateSets::new(),
             icosphere_vertex_count: icosphere.indices.len(),
-            dwts,
-            dwt_ibl_cubemap,
-            dwt_irradiance_cubemap,
+            dwt_ibl_cubemap: dwt_ibl_cubemap
+                .subresource_range(br::AspectMask::COLOR, 0..1, 0..6)
+                .view_builder()
+                .with_dimension(br::vk::VK_IMAGE_VIEW_TYPE_CUBE)
+                .create()
+                .expect("Failed to create IBL cubemap view"),
+            dwt_irradiance_cubemap: dwt_irradiance_cubemap
+                .subresource_range(br::AspectMask::COLOR, 0..1, 0..6)
+                .view_builder()
+                .with_dimension(br::vk::VK_IMAGE_VIEW_TYPE_CUBE)
+                .create()
+                .expect("Failed to create irradiance cubemap view"),
             dwt_prefiltered_envmap,
         }
     }
 
     pub fn apply_main_camera(
         &mut self,
-        e: &mut peridot::Graphics,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
         camera: &peridot::math::Camera,
         aspect: f32,
     ) {
         let camera_matrix = camera.view_projection_matrix(aspect);
 
-        self.update_sets.grid_mvp_stg_offset =
-            Some(self.dynamic_stg.push(e, camera_matrix.clone()));
+        self.update_sets.grid_mvp_stg_offset = Some(self.dynamic_stg.push(
+            e,
+            &mut self.manager,
+            camera_matrix.clone(),
+        ));
         self.update_sets.object_mvp_stg_offset = Some(self.dynamic_stg.push(
             e,
+            &mut self.manager,
             ObjectTransform {
                 mvp: camera_matrix,
                 model_transform: peridot::math::Matrix4::ONE,
                 view_projection: camera.view_matrix(),
             },
         ));
-        self.update_sets.camera_vp_separated_offset = Some(
-            self.dynamic_stg
-                .push(e, [camera.projection_matrix(aspect), camera.view_matrix()]),
-        )
+        self.update_sets.camera_vp_separated_offset = Some(self.dynamic_stg.push(
+            e,
+            &mut self.manager,
+            [camera.projection_matrix(aspect), camera.view_matrix()],
+        ))
     }
 
-    pub fn set_camera_info(&mut self, e: &mut peridot::Graphics, info: RasterizationCameraInfo) {
-        self.update_sets.camera_info_stg_offset = Some(self.dynamic_stg.push(e, info));
+    pub fn set_camera_info(
+        &mut self,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
+        info: RasterizationCameraInfo,
+    ) {
+        self.update_sets.camera_info_stg_offset =
+            Some(self.dynamic_stg.push(e, &mut self.manager, info));
     }
 
     pub fn set_directional_light_info(
         &mut self,
-        e: &mut peridot::Graphics,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
         info: RasterizationDirectionalLightInfo,
     ) {
-        self.update_sets.directional_light_info_stg_offset = Some(self.dynamic_stg.push(e, info));
+        self.update_sets.directional_light_info_stg_offset =
+            Some(self.dynamic_stg.push(e, &mut self.manager, info));
     }
 
-    pub fn set_material(&mut self, e: &mut peridot::Graphics, info: MaterialInfo) {
-        self.update_sets.material_stg_offset = Some(self.dynamic_stg.push(e, info));
+    pub fn set_material(
+        &mut self,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
+        info: MaterialInfo,
+    ) {
+        self.update_sets.material_stg_offset =
+            Some(self.dynamic_stg.push(e, &mut self.manager, info));
     }
 
     pub fn update_ui_fill_rect_vertices(
         &mut self,
-        e: &mut peridot::Graphics,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
         vertices: &[peridot::math::Vector2F32; mesh::UI_FILL_RECT_COUNT],
     ) {
-        self.update_sets.ui_fill_rects = Some(self.dynamic_stg.push_multiple_values(e, vertices));
+        self.update_sets.ui_fill_rects = Some(self.dynamic_stg.push_multiple_values(
+            e,
+            &mut self.manager,
+            vertices,
+        ));
     }
 
     pub fn construct_new_ui_fill_rect_vertices(
         &mut self,
-        e: &mut peridot::Graphics,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
         ctor: impl FnOnce(&mut [peridot::math::Vector2F32]),
     ) {
         self.update_sets.ui_fill_rects = Some(self.dynamic_stg.construct_multiple_values_inplace(
             e,
+            &mut self.manager,
             mesh::UI_FILL_RECT_COUNT,
             ctor,
         ));
@@ -978,141 +1096,94 @@ impl Memory {
 
     pub fn set_ui_transform(
         &mut self,
-        e: &mut peridot::Graphics,
+        e: &mut peridot::Engine<impl peridot::NativeLinker>,
         transform: peridot::math::Matrix4F32,
     ) {
-        self.update_sets.ui_transform = Some(self.dynamic_stg.push(e, transform));
+        self.update_sets.ui_transform =
+            Some(self.dynamic_stg.push(e, &mut self.manager, transform));
     }
 
-    pub fn ready_transfer(&mut self, e: &peridot::Graphics, tfb: &mut peridot::TransferBatch) {
+    pub fn ready_transfer<'s>(
+        &'s mut self,
+        e: &peridot::Graphics,
+        tfb: &mut peridot::TransferBatch2,
+    ) {
         self.dynamic_stg.end_mapped(e);
+        let get_dynamic_stg_buffer = || self.dynamic_stg.buffer().borrow();
 
         if let Some(o) = self.update_sets.grid_mvp_stg_offset.take() {
             let target_offset = self.mem.mut_buffer_placement + self.mutable_offsets.grid_mvp;
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(target_offset),
-                std::mem::size_of::<peridot::math::Matrix4F32>() as _,
+            tfb.copy_buffer(
+                self.dynamic_stg.buffer().clone(),
+                o,
+                self.mem.buffer.object.clone(),
+                target_offset,
+                core::mem::size_of::<peridot::math::Matrix4F32>() as _,
             );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::VERTEX_SHADER,
-                &self.mem.buffer.0,
-                self.grid_transform_range(),
+            tfb.register_outer_usage(
+                br::PipelineStageFlags::VERTEX_SHADER.0,
+                self.mem.buffer.object.clone(),
+                target_offset
+                    ..target_offset + core::mem::size_of::<peridot::math::Matrix4F32>() as u64,
                 br::AccessFlags::UNIFORM_READ,
             );
         }
 
         if let Some(o) = self.update_sets.object_mvp_stg_offset.take() {
-            let r = self.object_transform_range();
+            let r = self.object_transform_buffer().clone_inner_ref();
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(r.start),
-                std::mem::size_of::<ObjectTransform>() as _,
-            );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::VERTEX_SHADER,
-                &self.mem.buffer.0,
-                r,
-                br::AccessFlags::UNIFORM_READ,
-            )
+            r.clone()
+                .batched_copy_from(tfb, self.dynamic_stg.buffer().clone(), o);
+            r.batching_set_outer_usage(tfb, BufferUsage::VERTEX_UNIFORM);
         }
 
         if let Some(o) = self.update_sets.camera_info_stg_offset.take() {
-            let r = self.camera_info_range();
+            let r = self.camera_info_buffer().clone_inner_ref();
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(r.start),
-                std::mem::size_of::<RasterizationCameraInfo>() as _,
-            );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::FRAGMENT_SHADER,
-                &self.mem.buffer.0,
-                r,
-                br::AccessFlags::UNIFORM_READ,
-            );
+            r.clone()
+                .batched_copy_from(tfb, self.dynamic_stg.buffer().clone(), o);
+            r.batching_set_outer_usage(tfb, BufferUsage::FRAGMENT_UNIFORM);
         }
 
         if let Some(o) = self.update_sets.directional_light_info_stg_offset.take() {
-            let r = self.directional_light_info_range();
+            let r = self.directional_light_info_buffer().clone_inner_ref();
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(r.start),
-                std::mem::size_of::<RasterizationDirectionalLightInfo>() as _,
-            );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::FRAGMENT_SHADER,
-                &self.mem.buffer.0,
-                r,
-                br::AccessFlags::UNIFORM_READ,
-            );
+            r.clone()
+                .batched_copy_from(tfb, self.dynamic_stg.buffer().clone(), o);
+            r.batching_set_outer_usage(tfb, BufferUsage::FRAGMENT_UNIFORM);
         }
 
         if let Some(o) = self.update_sets.material_stg_offset.take() {
-            let r = self.material_range();
+            let r = self.material_buffer().clone_inner_ref();
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(r.start),
-                std::mem::size_of::<MaterialInfo>() as _,
-            );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::FRAGMENT_SHADER,
-                &self.mem.buffer.0,
-                r,
-                br::AccessFlags::UNIFORM_READ,
-            );
+            r.clone()
+                .batched_copy_from(tfb, self.dynamic_stg.buffer().clone(), o);
+            r.batching_set_outer_usage(tfb, BufferUsage::FRAGMENT_UNIFORM);
         }
 
         if let Some(o) = self.update_sets.ui_fill_rects.take() {
-            let r = self.ui_fill_rects_range();
+            let r = self.ui_fill_rects_buffer().clone_inner_ref();
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(r.start),
-                std::mem::size_of::<[peridot::math::Vector2F32; mesh::UI_FILL_RECT_COUNT]>() as _,
-            );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::VERTEX_INPUT,
-                &self.mem.buffer.0,
-                r,
-                br::AccessFlags::VERTEX_ATTRIBUTE_READ,
-            );
+            r.clone()
+                .batched_copy_from(tfb, self.dynamic_stg.buffer().clone(), o);
+            r.batching_set_outer_usage(tfb, BufferUsage::VERTEX_BUFFER);
         }
 
         if let Some(o) = self.update_sets.ui_transform.take() {
-            let r = self.ui_transform_range();
+            let r = self.ui_transform_buffer().clone_inner_ref();
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(r.start),
-                std::mem::size_of::<peridot::math::Matrix4F32>() as _,
-            );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::VERTEX_SHADER,
-                &self.mem.buffer.0,
-                r,
-                br::AccessFlags::UNIFORM_READ,
-            );
+            r.clone()
+                .batched_copy_from(tfb, self.dynamic_stg.buffer().clone(), o);
+            r.batching_set_outer_usage(tfb, BufferUsage::VERTEX_UNIFORM);
         }
 
         if let Some(o) = self.update_sets.camera_vp_separated_offset.take() {
-            let r = self.camera_vp_separated_range();
+            let r = self.camera_vp_separated_buffer().clone_inner_ref();
 
-            tfb.add_copying_buffer(
-                self.dynamic_stg.buffer().with_dev_offset(o),
-                self.mem.buffer.0.with_dev_offset(r.start),
-                std::mem::size_of::<[peridot::math::Matrix4F32; 2]>() as _,
-            );
-            tfb.add_buffer_graphics_ready(
-                br::PipelineStageFlags::VERTEX_SHADER,
-                &self.mem.buffer.0,
-                r,
-                br::AccessFlags::UNIFORM_READ,
-            );
+            r.clone()
+                .batched_copy_from(tfb, self.dynamic_stg.buffer().clone(), o);
+            r.batching_set_outer_usage(tfb, BufferUsage::VERTEX_UNIFORM);
         }
     }
 
@@ -1121,11 +1192,21 @@ impl Memory {
 
         target_offset..target_offset + std::mem::size_of::<peridot::math::Matrix4F32>() as u64
     }
+    pub fn grid_transform_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.grid_transform_range())
+    }
 
     pub fn object_transform_range(&self) -> std::ops::Range<u64> {
         let target_offset = self.mem.mut_buffer_placement + self.mutable_offsets.object_mvp;
 
         target_offset..target_offset + std::mem::size_of::<ObjectTransform>() as u64
+    }
+    pub fn object_transform_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.object_transform_range())
     }
 
     pub fn camera_info_range(&self) -> std::ops::Range<u64> {
@@ -1135,6 +1216,11 @@ impl Memory {
                     + std::mem::size_of::<RasterizationCameraInfo>() as u64,
         )
     }
+    pub fn camera_info_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.camera_info_range())
+    }
 
     pub fn directional_light_info_range(&self) -> std::ops::Range<u64> {
         self.mem.range_in_mut_buffer(
@@ -1143,12 +1229,22 @@ impl Memory {
                     + std::mem::size_of::<RasterizationDirectionalLightInfo>() as u64,
         )
     }
+    pub fn directional_light_info_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.directional_light_info_range())
+    }
 
     pub fn material_range(&self) -> std::ops::Range<u64> {
         self.mem.range_in_mut_buffer(
             self.mutable_offsets.material
                 ..self.mutable_offsets.material + std::mem::size_of::<MaterialInfo>() as u64,
         )
+    }
+    pub fn material_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.material_range())
     }
 
     pub fn ui_fill_rects_range(&self) -> std::ops::Range<u64> {
@@ -1159,6 +1255,11 @@ impl Memory {
                         as u64,
         )
     }
+    pub fn ui_fill_rects_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.ui_fill_rects_range())
+    }
 
     pub fn ui_transform_range(&self) -> std::ops::Range<u64> {
         self.mem.range_in_mut_buffer(
@@ -1167,6 +1268,11 @@ impl Memory {
                     + std::mem::size_of::<peridot::math::Matrix4F32>() as u64,
         )
     }
+    pub fn ui_transform_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.ui_transform_range())
+    }
 
     pub fn camera_vp_separated_range(&self) -> std::ops::Range<u64> {
         self.mem.range_in_mut_buffer(
@@ -1174,6 +1280,11 @@ impl Memory {
                 ..self.mutable_offsets.camera_vp_separated
                     + std::mem::size_of::<[peridot::math::Matrix4F32; 2]>() as u64,
         )
+    }
+    pub fn camera_vp_separated_buffer<'s>(
+        &'s self,
+    ) -> RangedBuffer<&'s SharedRef<impl br::Buffer + peridot::TransferrableBufferResource>> {
+        RangedBuffer(&self.mem.buffer.object, self.camera_vp_separated_range())
     }
 }
 
@@ -1249,12 +1360,13 @@ pub enum CapturingComponent {
 }
 
 pub struct RenderBundle {
-    pool: br::CommandPool,
-    buffers: Vec<br::CommandBuffer>,
+    pool: br::CommandPoolObject<peridot::DeviceObject>,
+    buffers: Vec<br::CommandBufferObject<peridot::DeviceObject>>,
 }
 impl RenderBundle {
     pub fn new(g: &peridot::Graphics, count: u32) -> br::Result<Self> {
-        let mut pool = br::CommandPool::new(&g, g.graphics_queue_family_index(), false, false)?;
+        let mut pool = br::CommandPoolBuilder::new(g.graphics_queue_family_index())
+            .create(g.device().clone())?;
 
         Ok(Self {
             buffers: pool.alloc(count, false)?,
@@ -1266,7 +1378,13 @@ impl RenderBundle {
         self.pool.reset(false)
     }
 
-    pub fn synchronized(&mut self, index: usize) -> br::SynchronizedCommandBuffer {
+    pub fn synchronized(
+        &mut self,
+        index: usize,
+    ) -> br::SynchronizedCommandBuffer<
+        br::CommandPoolObject<peridot::DeviceObject>,
+        br::CommandBufferObject<peridot::DeviceObject>,
+    > {
         unsafe { self.buffers[index].synchronize_with(&mut self.pool) }
     }
 }
@@ -1308,8 +1426,8 @@ impl FreeCameraView {
         init_camera_distance: f32,
         init_aspect_value: f32,
     ) -> Self {
-        let init_rot = peridot::math::Quaternion::new(init_yrot, peridot::math::Vector3::RIGHT)
-            * peridot::math::Quaternion::new(init_xrot, peridot::math::Vector3::UP);
+        let init_rot = peridot::math::Quaternion::new(init_yrot, peridot::math::Vector3::right())
+            * peridot::math::Quaternion::new(init_xrot, peridot::math::Vector3::up());
 
         Self {
             xrot: DirtyTracker::new(init_xrot),
@@ -1359,8 +1477,11 @@ impl FreeCameraView {
         let dy = self.yrot.take_dirty_flag();
         if dx || dy {
             self.camera.modify().0.rotation =
-                peridot::math::Quaternion::new(*self.yrot.get(), peridot::math::Vector3::RIGHT)
-                    * peridot::math::Quaternion::new(*self.xrot.get(), peridot::math::Vector3::UP);
+                peridot::math::Quaternion::new(*self.yrot.get(), peridot::math::Vector3::right())
+                    * peridot::math::Quaternion::new(
+                        *self.xrot.get(),
+                        peridot::math::Vector3::up(),
+                    );
         }
 
         let mx = e.input().analog_value_abs(ID_CAMERA_MOVE_AX_X);
@@ -1370,12 +1491,42 @@ impl FreeCameraView {
         if mx != 0.0 || my != 0.0 || mz != 0.0 {
             let xzv = peridot::math::Matrix3::from(peridot::math::Quaternion::new(
                 *self.xrot.get(),
-                peridot::math::Vector3::UP,
+                peridot::math::Vector3::up(),
             )) * peridot::math::Vector3(mx, 0.0, mz);
             self.camera.modify().0.position +=
                 (xzv + peridot::math::Vector3(0.0, my, 0.0)) * 2.0 * dt.as_secs_f32();
         }
     }
+}
+
+fn init_controls(e: &mut peridot::Engine<impl peridot::NativeLinker>) {
+    e.input_mut()
+        .map(peridot::NativeButtonInput::Mouse(0), ID_PLANE_PRESS);
+    e.input_mut().map(
+        peridot::AxisKey {
+            positive_key: peridot::NativeButtonInput::Character('D'),
+            negative_key: peridot::NativeButtonInput::Character('A'),
+        },
+        ID_CAMERA_MOVE_AX_X,
+    );
+    e.input_mut().map(
+        peridot::AxisKey {
+            positive_key: peridot::NativeButtonInput::Character('W'),
+            negative_key: peridot::NativeButtonInput::Character('S'),
+        },
+        ID_CAMERA_MOVE_AX_Z,
+    );
+    e.input_mut().map(
+        peridot::AxisKey {
+            positive_key: peridot::NativeButtonInput::Character('Q'),
+            negative_key: peridot::NativeButtonInput::Character('Z'),
+        },
+        ID_CAMERA_MOVE_AX_Y,
+    );
+    e.input_mut()
+        .map(peridot::NativeAnalogInput::MouseX, ID_CAMERA_ROT_AX_X);
+    e.input_mut()
+        .map(peridot::NativeAnalogInput::MouseY, ID_CAMERA_ROT_AX_Y);
 }
 
 pub struct Game<NL: peridot::NativeLinker> {
@@ -1384,8 +1535,8 @@ pub struct Game<NL: peridot::NativeLinker> {
     mem: Memory,
     screen_res: ScreenResources,
     ui_dynamic_buffers: UIRenderingBuffers,
-    command_buffers: peridot::CommandBundle,
-    update_commands: peridot::CommandBundle,
+    command_buffers: peridot::CommandBundle<peridot::DeviceObject>,
+    update_commands: peridot::CommandBundle<peridot::DeviceObject>,
     render_bundles: Vec<RenderBundle>,
     main_camera: FreeCameraView,
     material_data: DirtyTracker<MaterialInfo>,
@@ -1396,41 +1547,17 @@ pub struct Game<NL: peridot::NativeLinker> {
     ui_reflectance_slider: UISlider,
     plane_touch_edge: EdgeTrigger<bool>,
     last_frame_tfb: peridot::TransferBatch,
+    last_frame_tfb2: peridot::TransferBatch2,
     ph: std::marker::PhantomData<*const NL>,
 }
 impl<NL: peridot::NativeLinker> peridot::FeatureRequests for Game<NL> {}
 impl<NL: peridot::NativeLinker + Sync> peridot::EngineEvents<NL> for Game<NL>
 where
     NL::Presenter: Sync,
+    <NL::Presenter as peridot::PlatformPresenter>::BackBuffer: Send + Sync,
 {
     fn init(e: &mut peridot::Engine<NL>) -> Self {
-        e.input_mut()
-            .map(peridot::NativeButtonInput::Mouse(0), ID_PLANE_PRESS);
-        e.input_mut().map(
-            peridot::AxisKey {
-                positive_key: peridot::NativeButtonInput::Character('D'),
-                negative_key: peridot::NativeButtonInput::Character('A'),
-            },
-            ID_CAMERA_MOVE_AX_X,
-        );
-        e.input_mut().map(
-            peridot::AxisKey {
-                positive_key: peridot::NativeButtonInput::Character('W'),
-                negative_key: peridot::NativeButtonInput::Character('S'),
-            },
-            ID_CAMERA_MOVE_AX_Z,
-        );
-        e.input_mut().map(
-            peridot::AxisKey {
-                positive_key: peridot::NativeButtonInput::Character('Q'),
-                negative_key: peridot::NativeButtonInput::Character('Z'),
-            },
-            ID_CAMERA_MOVE_AX_Y,
-        );
-        e.input_mut()
-            .map(peridot::NativeAnalogInput::MouseX, ID_CAMERA_ROT_AX_X);
-        e.input_mut()
-            .map(peridot::NativeAnalogInput::MouseY, ID_CAMERA_ROT_AX_Y);
+        init_controls(e);
 
         let material_data = DirtyTracker::new(MaterialInfo {
             base_color: peridot::math::Vector4(1.0, 1.0, 1.0, 1.0),
@@ -1440,23 +1567,21 @@ where
             reflectance: 0.5,
         });
 
-        let bb0 = e.backbuffer(0).expect("no backbuffers?");
-        let render_area = AsRef::<br::vk::VkExtent2D>::as_ref(bb0.size())
-            .clone()
-            .into_rect(br::vk::VkOffset2D { x: 0, y: 0 });
-        let aspect = bb0.size().width as f32 / bb0.size().height as f32;
+        let bb0 = e.back_buffer(0).expect("no back-buffers?");
+        let render_area = bb0.image().size().wh().into_rect(br::vk::VkOffset2D::ZERO);
+        let aspect = render_area.extent.width as f32 / render_area.extent.height as f32;
 
         let mut ui = peridot_vg::Context::new(e.rendering_precision());
         let mut ui_control_mask = peridot_vg::Context::new(e.rendering_precision());
         let mut ui_dynamic_texts = peridot_vg::Context::new(e.rendering_precision());
         let font = Rc::new(
-            peridot_vg::FontProvider::new()
+            peridot_vg::DefaultFontProvider::new()
                 .expect("Failed to create FontProvider")
                 .best_match("Yu Gothic UI", &peridot_vg::FontProperties::default(), 18.0)
                 .expect("Failed to find best match font"),
         );
         let font_sm = Rc::new(
-            peridot_vg::FontProvider::new()
+            peridot_vg::DefaultFontProvider::new()
                 .expect("Failed to create FontProvider")
                 .best_match("Yu Gothic UI", &peridot_vg::FontProperties::default(), 14.0)
                 .expect("Failed to find best match font"),
@@ -1539,11 +1664,12 @@ where
 
         let const_res = ConstResources::new(e);
         let mut tfb = peridot::TransferBatch::new();
+        let mut tfb2 = peridot::TransferBatch2::new();
         let mut mem = Memory::new(e, &mut tfb, &ui, &ui_control_mask);
         let main_camera = FreeCameraView::new(0.0, -5.0f32.to_radians(), 5.0, aspect);
-        mem.apply_main_camera(e.graphics_mut(), &main_camera.camera.get().0, aspect);
+        mem.apply_main_camera(e, &main_camera.camera.get().0, aspect);
         mem.set_camera_info(
-            e.graphics_mut(),
+            e,
             RasterizationCameraInfo {
                 pos: peridot::math::Vector4(
                     main_camera.camera.get().0.position.0,
@@ -1554,54 +1680,56 @@ where
             },
         );
         mem.set_directional_light_info(
-            e.graphics_mut(),
+            e,
             RasterizationDirectionalLightInfo {
                 dir: peridot::math::Vector4(0.2f32, 0.3, -0.5, 0.0).normalize(),
                 intensity: peridot::math::Vector4(2.0, 2.0, 2.0, 1.0),
             },
         );
-        mem.set_material(e.graphics_mut(), material_data.get().clone());
-        mem.construct_new_ui_fill_rect_vertices(e.graphics_mut(), |vs| {
+        mem.set_material(e, material_data.get().clone());
+        mem.construct_new_ui_fill_rect_vertices(e, |vs| {
             for r in renderables {
                 r.render_dynamic_mesh(vs);
             }
         });
         mem.set_ui_transform(
-            e.graphics_mut(),
+            e,
             peridot::math::Camera {
                 projection: Some(peridot::math::ProjectionMethod::UI {
-                    design_width: bb0.size().width as _,
-                    design_height: bb0.size().height as _,
+                    design_width: bb0.image().size().width as _,
+                    design_height: bb0.image().size().height as _,
                 }),
                 ..Default::default()
             }
             .projection_matrix(aspect),
         );
-        mem.ready_transfer(e.graphics(), &mut tfb);
+        mem.ready_transfer(e.graphics(), &mut tfb2);
 
-        let ui_dynamic_buffers = UIRenderingBuffers::new(e.graphics(), &ui_dynamic_texts, &mut tfb)
-            .expect("Failed to allocate ui dynamic buffers");
+        let ui_dynamic_buffers =
+            UIRenderingBuffers::new(e.graphics(), &mut mem.manager, &ui_dynamic_texts, &mut tfb)
+                .expect("Failed to allocate ui dynamic buffers");
 
-        let background_asset = e
-            .load::<peridot_image::HDR>("background.GCanyon_C_YumaPoint_3k")
+        let background_asset: peridot_image::HDR = e
+            .load("background.GCanyon_C_YumaPoint_3k")
             .expect("Failed to load background image");
         let mut tmp_loaded_image = br::ImageDesc::new(
-            &peridot::math::Vector2(background_asset.info.width, background_asset.info.height),
+            peridot::math::Vector2(background_asset.info.width, background_asset.info.height),
             br::vk::VK_FORMAT_R16G16B16A16_SFLOAT,
             br::ImageUsage::SAMPLED,
             br::ImageLayout::Preinitialized,
         )
         .use_linear_tiling()
-        .create(e.graphics())
+        .create(e.graphics().device().clone())
         .expect("Failed to create tmp image data");
         let tmp_loaded_image_mreq = tmp_loaded_image.requirements();
 
         let mut bp = peridot::BufferPrealloc::new(e.graphics());
-        let fillrect_offset =
-            bp.add(peridot::BufferContent::vertices::<peridot::math::Vector4F32>(4));
-        let cube_ref_positions_offset = bp.add(peridot::BufferContent::vertices::<
+        let fillrect_offset = bp.add(peridot::BufferContent::vertex::<
             [peridot::math::Vector4F32; 4],
-        >(6));
+        >());
+        let cube_ref_positions_offset = bp.add(peridot::BufferContent::vertex::<
+            [[peridot::math::Vector4F32; 4]; 6],
+        >());
         let buffer_data_size = bp.total_size();
         let mut buffer = bp
             .build_custom_usage(br::BufferUsage::VERTEX_BUFFER)
@@ -1619,11 +1747,11 @@ where
                 br::MemoryPropertyFlags::HOST_COHERENT,
             )
             .expect("No suitable memory location for background image initialization");
-        let mut tmp_loaded_image_mem = br::DeviceMemory::allocate(
-            e.graphics(),
+        let mut tmp_loaded_image_mem = br::DeviceMemoryRequest::allocate(
             (buffer_placement_offset + buffer_mreq.size) as _,
             mx.index(),
         )
+        .execute(e.graphics().device().clone())
         .expect("Failed to allocate background image mmeory");
         tmp_loaded_image
             .bind(&tmp_loaded_image_mem, 0)
@@ -1632,19 +1760,18 @@ where
             .bind(&tmp_loaded_image_mem, buffer_placement_offset as _)
             .expect("Failed to bind memory");
         let tmp_loaded_image_view = tmp_loaded_image
-            .create_view(
-                None,
-                None,
-                &br::ComponentMapping::default(),
-                &br::ImageSubresourceRange::color(0..1, 0..1),
-            )
+            .subresource_range(br::AspectMask::COLOR, 0..1, 0..1)
+            .view_builder()
+            .create()
             .expect("Failed to create background image view");
 
         let m0 = tmp_loaded_image_mem
             .map(0..(buffer_placement_offset + buffer_data_size) as _)
             .expect("Failed to map memory");
-        let row_stride = tmp_loaded_image
-            .image_subresource_layout(br::AspectMask::COLOR, 0, 0)
+        let row_stride = tmp_loaded_image_view
+            .image()
+            .subresource(br::AspectMask::COLOR, 0, 0)
+            .layout_info()
             .rowPitch;
         for r in 0..background_asset.info.height {
             let row_source = background_asset.pixels[r as usize
@@ -1728,7 +1855,6 @@ where
                     br::ImageLayout::Undefined,
                     br::ImageLayout::ShaderReadOnlyOpt,
                 )
-                .load_op(br::LoadOp::DontCare)
                 .store_op(br::StoreOp::Store),
             )
             .add_subpass(br::SubpassDescription::new().add_color_output(
@@ -1745,33 +1871,39 @@ where
                 dstAccessMask: br::AccessFlags::SHADER.read,
                 dependencyFlags: br::vk::VK_DEPENDENCY_BY_REGION_BIT,
             })
-            .create(e.graphics())
+            .create(e.graphics().device().clone())
             .expect("Failed to create equirectangular to cubemap render pass");
         let equirect_to_cubemap_fbs = (0..6)
             .map(|l| {
-                let iv = mem.dwts.get(mem.dwt_ibl_cubemap).underlying().create_view(
-                    None,
-                    None,
-                    &br::ComponentMapping::default(),
-                    &br::ImageSubresourceRange::color(0..1, l..l + 1),
-                )?;
-                br::Framebuffer::new(&precompute_rp, &[&iv], iv.size().as_ref(), 1)
+                let iv = mem
+                    .dwt_ibl_cubemap
+                    .by_ref()
+                    .subresource_range(br::AspectMask::COLOR, 0..1, l..l + 1)
+                    .view_builder()
+                    .create()?;
+                let s = iv.size().as_ref();
+
+                e.graphics()
+                    .device()
+                    .clone()
+                    .new_framebuffer(&precompute_rp, vec![iv], s, 1)
             })
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to create equirect to cubemap frame buffer");
         let irradiance_precompute_fbs = (0..6)
             .map(|l| {
                 let iv = mem
-                    .dwts
-                    .get(mem.dwt_irradiance_cubemap)
-                    .underlying()
-                    .create_view(
-                        None,
-                        None,
-                        &br::ComponentMapping::default(),
-                        &br::ImageSubresourceRange::color(0..1, l..l + 1),
-                    )?;
-                br::Framebuffer::new(&precompute_rp, &[&iv], iv.size().as_ref(), 1)
+                    .dwt_irradiance_cubemap
+                    .by_ref()
+                    .subresource_range(br::AspectMask::COLOR, 0..1, l..l + 1)
+                    .view_builder()
+                    .create()?;
+                let s = iv.size().as_ref();
+
+                e.graphics()
+                    .device()
+                    .clone()
+                    .new_framebuffer(&precompute_rp, vec![iv], s, 1)
             })
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to create irradiance precompute frame buffer");
@@ -1779,18 +1911,15 @@ where
             .flat_map(|d| (0..PREFILTERED_ENVMAP_MIP_LEVELS).map(move |ml| (d, ml)))
             .map(|(d, ml)| {
                 let iv = mem
-                    .dwts
-                    .get(mem.dwt_prefiltered_envmap)
-                    .underlying()
-                    .create_view(
-                        None,
-                        None,
-                        &br::ComponentMapping::default(),
-                        &br::ImageSubresourceRange::color(ml..ml + 1, d..d + 1),
-                    )?;
-                br::Framebuffer::new(
+                    .dwt_prefiltered_envmap
+                    .by_ref()
+                    .subresource_range(br::AspectMask::COLOR, ml..ml + 1, d..d + 1)
+                    .view_builder()
+                    .create()?;
+
+                e.graphics().device().clone().new_framebuffer(
                     &precompute_rp,
-                    &[&iv],
+                    vec![iv],
                     &br::vk::VkExtent2D {
                         width: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _)) as _,
                         height: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _)) as _,
@@ -1802,108 +1931,104 @@ where
             .expect("Failed to create prefiltered envmap frame buffer");
 
         let equirect_to_cubemap_shader = peridot_vertex_processing_pack::PvpShaderModules::new(
-            e.graphics(),
+            e.graphics().device(),
             e.load("shaders.equirectangular_to_cubemap")
                 .expect("Failed to load equirectangular to cubemap shader"),
         )
         .expect("Failed to create equirectangular to cubemap shader modules");
         let irradiance_precompute_shader = PvpShaderModules::new(
-            e.graphics(),
+            e.graphics().device(),
             e.load("shaders.irradiance_convolution")
                 .expect("Failed to load irradiance convolution shader"),
         )
         .expect("Failed to create irradiance convolution shader modules");
         let prefilter_envmap_shader = PvpShaderModules::new(
-            e.graphics(),
+            e.graphics().device(),
             e.load("shaders.prefilter_env")
                 .expect("Failed to load envmap prefilter shader"),
         )
         .expect("Failed to create envmap prefilter shader modules");
         let linear_smp = br::SamplerBuilder::default()
-            .create(e.graphics())
+            .create(e.graphics().device().clone())
             .expect("Failed to default sampler");
         let dsl = DetailedDescriptorSetLayout::new(
             e.graphics(),
-            &[br::DescriptorSetLayoutBinding::CombinedImageSampler(
-                1,
-                br::ShaderStage::FRAGMENT,
-                &[linear_smp.native_ptr()],
-            )],
+            vec![br::DescriptorType::CombinedImageSampler
+                .make_binding(1)
+                .only_for_fragment()
+                .with_immutable_samplers(vec![br::SamplerObjectRef::new(&linear_smp)])],
         )
         .expect("Failed to create equirectangular to cubemap descriptor set layout");
-        let precompute_common_pl = br::PipelineLayout::new(e.graphics(), &[&dsl.object], &[])
+        let precompute_common_pl = br::PipelineLayoutBuilder::new(vec![&dsl.object], vec![])
+            .create(e.graphics().device().clone())
             .expect("Failed to create precompute common pipeline layout");
-        let prefilter_envmap_pl = br::PipelineLayout::new(
-            e.graphics(),
-            &[&dsl.object],
-            &[(br::ShaderStage::FRAGMENT, 0..4)],
+        let prefilter_envmap_pl = br::PipelineLayoutBuilder::new(
+            vec![&dsl.object],
+            vec![(br::ShaderStage::FRAGMENT, 0..4)],
         )
+        .create(e.graphics().device().clone())
         .expect("Failed to create envmap prefilter pipeline layout");
-        let precompute_ds = DescriptorStore::new(e.graphics(), &[&dsl, &dsl])
+        let precompute_ds = DescriptorStore::new(e.graphics(), [&dsl, &dsl])
             .expect("Failed to allocate equirectangular to cubemap descriptor sets");
         e.graphics().update_descriptor_sets(
             &[
-                br::DescriptorSetWriteInfo(
-                    precompute_ds.descriptor(0).unwrap().into(),
-                    0,
-                    0,
-                    br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
-                        None,
-                        tmp_loaded_image_view.native_ptr(),
-                        br::ImageLayout::ShaderReadOnlyOpt,
-                    )]),
+                precompute_ds.descriptor(0).unwrap().write(
+                    br::DescriptorContents::CombinedImageSampler(vec![
+                        br::DescriptorImageRef::new(
+                            &tmp_loaded_image_view,
+                            br::ImageLayout::ShaderReadOnlyOpt,
+                        ),
+                    ]),
                 ),
-                br::DescriptorSetWriteInfo(
-                    precompute_ds.descriptor(1).unwrap().into(),
-                    0,
-                    0,
-                    br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
-                        None,
-                        mem.dwts.get(mem.dwt_ibl_cubemap).view().native_ptr(),
-                        br::ImageLayout::ShaderReadOnlyOpt,
-                    )]),
+                precompute_ds.descriptor(1).unwrap().write(
+                    br::DescriptorContents::CombinedImageSampler(vec![
+                        br::DescriptorImageRef::new(
+                            &mem.dwt_ibl_cubemap,
+                            br::ImageLayout::ShaderReadOnlyOpt,
+                        ),
+                    ]),
                 ),
             ],
             &[],
         );
-        let mut precompute_pipeline = br::GraphicsPipelineBuilder::new(
+        let mut precompute_pipeline = br::GraphicsPipelineBuilder::<
+            _,
+            br::PipelineObject<peridot::DeviceObject>,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >::new(
             &precompute_common_pl,
             (&precompute_rp, 0),
             equirect_to_cubemap_shader.generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
         );
-        let equirect_to_cubemap_render_rect = br::vk::VkRect2D {
-            offset: br::vk::VkOffset2D { x: 0, y: 0 },
-            extent: br::vk::VkExtent2D {
-                width: 512,
-                height: 512,
-            },
-        };
-        let irradiance_precompute_render_rect = br::vk::VkRect2D {
-            offset: br::vk::VkOffset2D { x: 0, y: 0 },
-            extent: br::vk::VkExtent2D {
-                width: 32,
-                height: 32,
-            },
-        };
+        let equirect_to_cubemap_render_rect =
+            br::vk::VkExtent2D::spread1(512).into_rect(br::vk::VkOffset2D::ZERO);
+        let irradiance_precompute_render_rect =
+            br::vk::VkExtent2D::spread1(32).into_rect(br::vk::VkOffset2D::ZERO);
         precompute_pipeline
             .viewport_scissors(
-                br::DynamicArrayState::Static(&[br::vk::VkViewport::from_rect_with_depth_range(
-                    &equirect_to_cubemap_render_rect,
-                    0.0..1.0,
-                )]),
+                br::DynamicArrayState::Static(&[
+                    equirect_to_cubemap_render_rect.make_viewport(0.0..1.0)
+                ]),
                 br::DynamicArrayState::Static(&[equirect_to_cubemap_render_rect.clone()]),
             )
             .add_attachment_blend(br::AttachmentColorBlendState::noblend())
             .multisample_state(Some(br::MultisampleState::new()));
         let equirect_to_cubemap_pipeline = precompute_pipeline
-            .create(e.graphics(), None)
+            .create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
             .expect("Failed to create equirectangular to cubemap pipeline");
         precompute_pipeline
             .viewport_scissors(
-                br::DynamicArrayState::Static(&[br::vk::VkViewport::from_rect_with_depth_range(
-                    &irradiance_precompute_render_rect,
-                    0.0..1.0,
-                )]),
+                br::DynamicArrayState::Static(&[
+                    irradiance_precompute_render_rect.make_viewport(0.0..1.0)
+                ]),
                 br::DynamicArrayState::Static(&[irradiance_precompute_render_rect.clone()]),
             )
             .vertex_processing(
@@ -1911,7 +2036,10 @@ where
                     .generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
             );
         let irradiance_precompute_pipeline = precompute_pipeline
-            .create(e.graphics(), None)
+            .create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
             .expect("Failed to create irradiance precompute pipeline");
         precompute_pipeline
             .layout(&prefilter_envmap_pl)
@@ -1923,152 +2051,162 @@ where
                 prefilter_envmap_shader.generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
             );
         let envmap_prefilter_pipeline = precompute_pipeline
-            .create(e.graphics(), None)
+            .create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
             .expect("Failed to create envmap prefilter pipeline");
 
         async_std::task::block_on(async {
-            e.submit_commands_async(|r| {
-                tfb.sink_transfer_commands(r);
-                tfb.sink_graphics_ready_commands(r);
+            let cubemap_precompute_meshes = (0..6)
+                .map(|n| StandardMesh {
+                    vertex_buffers: vec![
+                        RangedBuffer::from_offset_length(&buffer, fillrect_offset, 1),
+                        RangedBuffer::from_offset_length(
+                            &buffer,
+                            cube_ref_positions_offset
+                                + (n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>())
+                                    as u64,
+                            1,
+                        ),
+                    ],
+                    vertex_count: 4,
+                })
+                .collect::<Vec<_>>();
 
-                r.pipeline_barrier(
-                    br::PipelineStageFlags::BOTTOM_OF_PIPE.host(),
-                    br::PipelineStageFlags::VERTEX_INPUT.fragment_shader(),
-                    false,
-                    &[],
-                    &[br::BufferMemoryBarrier::new(
-                        &buffer,
-                        0..buffer_data_size,
-                        br::AccessFlags::HOST.write,
-                        br::AccessFlags::VERTEX_ATTRIBUTE_READ,
-                    )],
-                    &[br::ImageMemoryBarrier::new(
-                        &br::ImageSubref::color(&tmp_loaded_image, 0..1, 0..1),
+            e.submit_commands_async(|mut r| {
+                tfb.sink_transfer_commands(&mut r);
+                tfb.sink_graphics_ready_commands(&mut r);
+                tfb2.generate_commands(&mut r);
+
+                let vertex_buffer = RangedBuffer(&buffer, 0..buffer_data_size);
+                let temporary_loaded_image =
+                    RangedImage::single_color_plane(tmp_loaded_image_view.image());
+
+                let pre_barrier = PipelineBarrier::new()
+                    .with_barrier(
+                        vertex_buffer
+                            .usage_barrier(BufferUsage::HOST_RW, BufferUsage::VERTEX_BUFFER),
+                    )
+                    .with_barrier(temporary_loaded_image.barrier(
                         br::ImageLayout::Preinitialized,
                         br::ImageLayout::ShaderReadOnlyOpt,
-                    )],
-                );
+                    ));
 
-                // multiview拡張とかつかうとbegin_render_pass一回にできるけど面倒なので適当にやる
-                r.bind_graphics_pipeline_pair(&equirect_to_cubemap_pipeline, &precompute_common_pl)
-                    .bind_graphics_descriptor_sets(
-                        0,
-                        &[precompute_ds.descriptor(0).unwrap().into()],
-                        &[],
-                    );
-                for (n, fb) in equirect_to_cubemap_fbs.iter().enumerate() {
-                    r.begin_render_pass(
+                let pipeline = peridot::LayoutedPipeline::combine(
+                    &equirect_to_cubemap_pipeline,
+                    &precompute_common_pl,
+                );
+                let descriptor_sets =
+                    DescriptorSets(vec![precompute_ds.raw_descriptor(0).unwrap().into()]);
+
+                // multiview拡張とかつかうとbegin_render_pass一回にできるけど面倒なので適当に回す
+                let render_pass_begin_commands = equirect_to_cubemap_fbs.iter().map(|fb| {
+                    BeginRenderPass::new(
                         &precompute_rp,
                         fb,
                         equirect_to_cubemap_render_rect.clone(),
-                        &[],
-                        true,
                     )
-                    .bind_vertex_buffers(
-                        0,
-                        &[
-                            (&buffer, fillrect_offset as _),
-                            (
-                                &buffer,
-                                cube_ref_positions_offset as usize
-                                    + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
-                            ),
-                        ],
-                    )
-                    .draw(4, 1, 0, 0)
-                    .end_render_pass();
-                }
+                });
+                let draw_commands = cubemap_precompute_meshes.iter().map(|m| m.ref_draw(1));
+                let renders = render_pass_begin_commands
+                    .zip(draw_commands)
+                    .map(|(rp, d)| d.between(rp, EndRenderPass))
+                    .collect::<Vec<_>>();
+
+                renders
+                    .after_of((pipeline, descriptor_sets.bind_graphics()))
+                    .after_of(pre_barrier)
+                    .execute(&mut r.as_dyn_ref());
+
+                r
             })
             .expect("Failed to submit initialize commands")
             .await
             .expect("Failed to initialize cubemap");
 
             let irradiance_precompute_task = e
-                .submit_commands_async(|r| {
-                    r.bind_graphics_pipeline_pair(
+                .submit_commands_async(|mut r| {
+                    let pipeline = peridot::LayoutedPipeline::combine(
                         &irradiance_precompute_pipeline,
                         &precompute_common_pl,
-                    )
-                    .bind_graphics_descriptor_sets(
-                        0,
-                        &[precompute_ds.descriptor(1).unwrap().into()],
-                        &[],
                     );
-                    for (n, fb) in irradiance_precompute_fbs.iter().enumerate() {
-                        r.begin_render_pass(
+                    let descriptor_sets =
+                        DescriptorSets(vec![precompute_ds.raw_descriptor(1).unwrap().into()]);
+
+                    let render_pass_begin_commands = irradiance_precompute_fbs.iter().map(|fb| {
+                        BeginRenderPass::new(
                             &precompute_rp,
                             fb,
                             irradiance_precompute_render_rect.clone(),
-                            &[],
-                            true,
                         )
-                        .bind_vertex_buffers(
-                            0,
-                            &[
-                                (&buffer, fillrect_offset as _),
-                                (
-                                    &buffer,
-                                    cube_ref_positions_offset as usize
-                                        + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
-                                ),
-                            ],
-                        )
-                        .draw(4, 1, 0, 0)
-                        .end_render_pass();
-                    }
+                    });
+                    let draw_commands = cubemap_precompute_meshes.iter().map(|m| m.ref_draw(1));
+                    let renders = render_pass_begin_commands
+                        .zip(draw_commands)
+                        .map(|(rp, d)| d.between(rp, EndRenderPass))
+                        .collect::<Vec<_>>();
+
+                    renders
+                        .after_of((pipeline, descriptor_sets.bind_graphics()))
+                        .execute(&mut r.as_dyn_ref());
+
+                    r
                 })
                 .expect("Failed to submit irradiance precompute commands");
             let prefilter_envmap_task = e
-                .submit_commands_async(|r| {
-                    r.bind_graphics_pipeline_pair(&envmap_prefilter_pipeline, &prefilter_envmap_pl)
-                        .bind_graphics_descriptor_sets(
-                            0,
-                            &[precompute_ds.descriptor(1).unwrap().into()],
-                            &[],
-                        );
-                    for n in 0usize..6 {
-                        let target_framebuffers = &prefiltered_envmap_fbs[n
-                            * PREFILTERED_ENVMAP_MIP_LEVELS as usize
-                            ..(n + 1) * PREFILTERED_ENVMAP_MIP_LEVELS as usize];
+                .submit_commands_async(|mut r| {
+                    let pipeline = peridot::LayoutedPipeline::combine(
+                        &envmap_prefilter_pipeline,
+                        &prefilter_envmap_pl,
+                    );
+                    let descriptor_sets =
+                        DescriptorSets(vec![precompute_ds.raw_descriptor(1).unwrap().into()]);
 
-                        r.bind_vertex_buffers(
-                            0,
-                            &[
-                                (&buffer, fillrect_offset as _),
-                                (
-                                    &buffer,
-                                    cube_ref_positions_offset as usize
-                                        + n * std::mem::size_of::<[peridot::math::Vector4F32; 4]>(),
-                                ),
-                            ],
-                        );
-                        for (ml, fb) in target_framebuffers.iter().enumerate() {
-                            let roughness =
-                                ml as f32 / (PREFILTERED_ENVMAP_MIP_LEVELS as f32 - 1.0);
-                            let region = br::vk::VkRect2D {
-                                offset: br::vk::VkOffset2D { x: 0, y: 0 },
-                                extent: br::vk::VkExtent2D {
-                                    width: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _))
-                                        as _,
-                                    height: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _))
-                                        as _,
-                                },
-                            };
+                    let by_cubemap_renders = cubemap_precompute_meshes
+                        .iter()
+                        .enumerate()
+                        .map(|(n, transform_mesh)| {
+                            let target_framebuffers = &prefiltered_envmap_fbs[n
+                                * PREFILTERED_ENVMAP_MIP_LEVELS as usize
+                                ..(n + 1) * PREFILTERED_ENVMAP_MIP_LEVELS as usize];
 
-                            r.begin_render_pass(&precompute_rp, fb, region.clone(), &[], true)
-                                .set_viewport(
-                                    0,
-                                    &[br::vk::VkViewport::from_rect_with_depth_range(
-                                        &region,
-                                        0.0..1.0,
-                                    )],
-                                )
-                                .set_scissor(0, &[region])
-                                .push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &roughness)
-                                .draw(4, 1, 0, 0)
-                                .end_render_pass();
-                        }
-                    }
+                            let by_mip_renders = target_framebuffers
+                                .iter()
+                                .enumerate()
+                                .map(|(mip_level, fb)| {
+                                    let roughness = mip_level as f32
+                                        / (PREFILTERED_ENVMAP_MIP_LEVELS as f32 - 1.0);
+                                    let envmap_size = (PREFILTERED_ENVMAP_SIZE as f32
+                                        * 0.5f32.powi(mip_level as _))
+                                        as u32;
+                                    let region = br::vk::VkExtent2D::spread1(envmap_size)
+                                        .into_rect(br::vk::VkOffset2D::ZERO);
+
+                                    let rp =
+                                        BeginRenderPass::new(&precompute_rp, fb, region.clone());
+                                    let set_viewports = ViewportWithScissorRect(
+                                        region.make_viewport(0.0..1.0),
+                                        region,
+                                    );
+                                    let set_roughness = PushConstant::for_fragment(0, roughness);
+                                    let draw_plane = SimpleDraw(4, 1, 0, 0);
+
+                                    draw_plane
+                                        .after_of(set_roughness)
+                                        .between(rp.then(set_viewports), EndRenderPass)
+                                })
+                                .collect::<Vec<_>>();
+
+                            by_mip_renders.after_of(transform_mesh.ref_pre_configure_for_draw())
+                        })
+                        .collect::<Vec<_>>();
+
+                    by_cubemap_renders
+                        .after_of((pipeline, descriptor_sets.bind_graphics()))
+                        .execute(&mut r.as_dyn_ref());
+
+                    r
                 })
                 .expect("Failed to submit prefilter envmap commands");
 
@@ -2085,7 +2223,7 @@ where
 
         let descriptors = DescriptorStore::new(
             e.graphics(),
-            &[
+            [
                 &const_res.dsl_ub1,
                 &const_res.dsl_ub1,
                 &const_res.dsl_ub2_f,
@@ -2100,109 +2238,91 @@ where
             ],
         )
         .expect("Failed to allocate descriptors");
-        let mut dub = peridot::DescriptorSetUpdateBatch::new();
-        dub.write(
-            descriptors.descriptor(0).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformBuffer(vec![(
-                mem.mem.buffer.0.native_ptr(),
-                range_cast_u64_usize(mem.grid_transform_range()),
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(1).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformBuffer(vec![(
-                mem.mem.buffer.0.native_ptr(),
-                range_cast_u64_usize(mem.object_transform_range()),
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(2).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformBuffer(vec![(
-                mem.mem.buffer.0.native_ptr(),
-                range_cast_u64_usize(mem.camera_info_range()),
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(2).unwrap(),
-            1,
-            br::DescriptorUpdateInfo::UniformBuffer(vec![(
-                mem.mem.buffer.0.native_ptr(),
-                range_cast_u64_usize(mem.directional_light_info_range()),
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(3).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformBuffer(vec![(
-                mem.mem.buffer.0.native_ptr(),
-                range_cast_u64_usize(mem.material_range()),
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(4).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformTexelBuffer(vec![mem
-                .ui_transform_buffer_view
-                .native_ptr()]),
-        );
-        dub.write(
-            descriptors.descriptor(5).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformTexelBuffer(vec![mem
-                .ui_mask_transform_buffer_view
-                .native_ptr()]),
-        );
-        dub.write(
-            descriptors.descriptor(6).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformTexelBuffer(vec![ui_dynamic_buffers
-                .transform_buffer_view()
-                .native_ptr()]),
-        );
-        dub.write(
-            descriptors.descriptor(7).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformBuffer(vec![(
-                mem.mem.buffer.0.native_ptr(),
-                range_cast_u64_usize(mem.ui_transform_range()),
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(8).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::UniformBuffer(vec![(
-                mem.mem.buffer.0.native_ptr(),
-                range_cast_u64_usize(mem.camera_vp_separated_range()),
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(9).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
-                None,
-                mem.dwts.get(mem.dwt_ibl_cubemap).view().native_ptr(),
-                br::ImageLayout::ShaderReadOnlyOpt,
-            )]),
-        );
-        dub.write(
-            descriptors.descriptor(10).unwrap(),
-            0,
-            br::DescriptorUpdateInfo::CombinedImageSampler(vec![(
-                None,
-                mem.dwts.get(mem.dwt_irradiance_cubemap).view().native_ptr(),
-                br::ImageLayout::ShaderReadOnlyOpt,
-            )]),
-        );
-        dub.submit(e.graphics_device());
+        let mut descriptor_writes = Vec::with_capacity(12);
+        descriptor_writes.extend([
+            descriptors
+                .descriptor(0)
+                .unwrap()
+                .write(br::DescriptorContents::UniformBuffer(vec![mem
+                    .grid_transform_buffer()
+                    .into_descriptor_buffer_ref()])),
+            descriptors
+                .descriptor(1)
+                .unwrap()
+                .write(br::DescriptorContents::UniformBuffer(vec![mem
+                    .object_transform_buffer()
+                    .into_descriptor_buffer_ref()])),
+        ]);
+        descriptor_writes.extend(descriptors.descriptor(2).unwrap().write_multiple([
+            br::DescriptorContents::UniformBuffer(vec![
+                mem.camera_info_buffer().into_descriptor_buffer_ref(),
+            ]),
+            br::DescriptorContents::UniformBuffer(
+                vec![mem.directional_light_info_buffer().into_descriptor_buffer_ref()],
+            ),
+        ]));
+        descriptor_writes.extend([
+            descriptors
+                .descriptor(3)
+                .unwrap()
+                .write(br::DescriptorContents::UniformBuffer(vec![mem
+                    .material_buffer()
+                    .into_descriptor_buffer_ref()])),
+            descriptors
+                .descriptor(4)
+                .unwrap()
+                .write(br::DescriptorContents::UniformTexelBuffer(vec![
+                    br::VkHandleRef::new(&mem.ui_transform_buffer_view),
+                ])),
+            descriptors
+                .descriptor(5)
+                .unwrap()
+                .write(br::DescriptorContents::UniformTexelBuffer(vec![
+                    br::VkHandleRef::new(&mem.ui_mask_transform_buffer_view),
+                ])),
+            descriptors
+                .descriptor(6)
+                .unwrap()
+                .write(br::DescriptorContents::UniformTexelBuffer(vec![
+                    br::VkHandleRef::new(ui_dynamic_buffers.transform_buffer_view()),
+                ])),
+            descriptors
+                .descriptor(7)
+                .unwrap()
+                .write(br::DescriptorContents::UniformBuffer(vec![mem
+                    .ui_transform_buffer()
+                    .into_descriptor_buffer_ref()])),
+            descriptors
+                .descriptor(8)
+                .unwrap()
+                .write(br::DescriptorContents::UniformBuffer(vec![mem
+                    .camera_vp_separated_buffer()
+                    .into_descriptor_buffer_ref()])),
+            descriptors
+                .descriptor(9)
+                .unwrap()
+                .write(br::DescriptorContents::CombinedImageSampler(vec![
+                    br::DescriptorImageRef::new(
+                        &mem.dwt_ibl_cubemap,
+                        br::ImageLayout::ShaderReadOnlyOpt,
+                    ),
+                ])),
+            descriptors.descriptor(10).unwrap().write(
+                br::DescriptorContents::CombinedImageSampler(vec![br::DescriptorImageRef::new(
+                    &mem.dwt_irradiance_cubemap,
+                    br::ImageLayout::ShaderReadOnlyOpt,
+                )]),
+            ),
+        ]);
+        e.graphics()
+            .device()
+            .update_descriptor_sets(&descriptor_writes, &[]);
 
-        let screen_res = ScreenResources::new(e, &const_res);
+        let screen_res = ScreenResources::new(e, &mut mem.manager, &const_res);
 
         let mut render_bundles = (0..6)
             .map(|_| {
-                RenderBundle::new(e.graphics(), e.backbuffer_count() as _)
+                RenderBundle::new(e.graphics(), e.back_buffer_count() as _)
                     .expect("Failed to create render bundle")
             })
             .collect::<Vec<_>>();
@@ -2215,53 +2335,53 @@ where
             };
 
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_ui_mask_render_commands(
                         e,
                         rb0.synchronized(n),
                         &const_res.render_pass,
                         &screen_res,
                         n,
-                        &mem.mem.buffer.0,
-                        descriptors.descriptor(5).unwrap(),
+                        &**mem.mem.buffer.object,
+                        descriptors.raw_descriptor(5).unwrap(),
                         &mem.ui_mask_render_params,
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_grid_render_commands(
                         e,
                         rb1.synchronized(n),
                         &const_res.render_pass,
                         &screen_res,
                         n,
-                        &mem.mem.buffer.0,
+                        &mem.mem.buffer.object,
                         &mem.static_offsets,
-                        descriptors.descriptor(0).unwrap(),
+                        descriptors.raw_descriptor(0).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_pbr_object_render_commands(
                         e,
                         rb2.synchronized(n),
                         &const_res.render_pass,
                         &screen_res,
                         n,
-                        &mem.mem.buffer.0,
+                        &mem.mem.buffer.object,
                         &mem.static_offsets,
                         mem.icosphere_vertex_count as _,
-                        descriptors.descriptor(1).unwrap(),
-                        descriptors.descriptor(2).unwrap(),
-                        descriptors.descriptor(3).unwrap(),
-                        descriptors.descriptor(10).unwrap(),
+                        descriptors.raw_descriptor(1).unwrap(),
+                        descriptors.raw_descriptor(2).unwrap(),
+                        descriptors.raw_descriptor(3).unwrap(),
+                        descriptors.raw_descriptor(10).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_static_ui_render_commands(
                         e,
                         rb3.synchronized(n),
@@ -2269,17 +2389,17 @@ where
                         &screen_res,
                         n,
                         &mem.ui_render_params,
-                        &mem.mem.buffer.0,
+                        &**mem.mem.buffer.object,
                         &mem.static_offsets,
                         &mem.mutable_offsets,
                         mem.mem.mut_buffer_placement,
-                        descriptors.descriptor(7).unwrap(),
-                        descriptors.descriptor(4).unwrap(),
+                        descriptors.raw_descriptor(7).unwrap(),
+                        descriptors.raw_descriptor(4).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_dynamic_ui_render_commands(
                         e,
                         rb4.synchronized(n),
@@ -2287,23 +2407,23 @@ where
                         &screen_res,
                         n,
                         &ui_dynamic_buffers,
-                        descriptors.descriptor(6).unwrap(),
+                        descriptors.raw_descriptor(6).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_skybox_render_commands(
                         e,
                         rb5.synchronized(n),
                         &const_res.render_pass,
                         &screen_res,
                         n,
-                        &mem.mem.buffer.0,
+                        &mem.mem.buffer.object,
                         &mem.static_offsets,
                         &[
-                            descriptors.descriptor(8).unwrap().into(),
-                            descriptors.descriptor(9).unwrap().into(),
+                            descriptors.raw_descriptor(8).unwrap().into(),
+                            descriptors.raw_descriptor(9).unwrap().into(),
                         ],
                     )
                 }
@@ -2313,7 +2433,7 @@ where
         let mut command_buffers = peridot::CommandBundle::new(
             e.graphics(),
             peridot::CBSubmissionType::Graphics,
-            e.backbuffer_count(),
+            e.back_buffer_count(),
         )
         .expect("Failed to alloc command bundle");
         Self::repopulate_screen_commands(
@@ -2346,6 +2466,7 @@ where
             ui_metallic_slider,
             ui_reflectance_slider,
             last_frame_tfb: peridot::TransferBatch::new(),
+            last_frame_tfb2: peridot::TransferBatch2::new(),
             ph: std::marker::PhantomData,
         }
     }
@@ -2355,8 +2476,9 @@ where
         e: &mut peridot::Engine<NL>,
         on_backbuffer_of: u32,
         delta_time: std::time::Duration,
-    ) -> (Option<br::SubmissionBatch>, br::SubmissionBatch) {
+    ) {
         self.last_frame_tfb = peridot::TransferBatch::new();
+        self.last_frame_tfb2 = peridot::TransferBatch2::new();
 
         let press_inframe = self
             .plane_touch_edge
@@ -2412,12 +2534,12 @@ where
 
         if self.main_camera.camera.take_dirty_flag() {
             self.mem.apply_main_camera(
-                e.graphics_mut(),
+                e,
                 &self.main_camera.camera.get().0,
                 self.main_camera.camera.get().1,
             );
             self.mem.set_camera_info(
-                e.graphics_mut(),
+                e,
                 RasterizationCameraInfo {
                     pos: peridot::math::Vector4(
                         self.main_camera.camera.get().0.position.0,
@@ -2430,40 +2552,41 @@ where
         }
 
         if self.material_data.take_dirty_flag() {
-            self.mem
-                .set_material(e.graphics_mut(), self.material_data.get().clone());
+            self.mem.set_material(e, self.material_data.get().clone());
         }
 
         if ui_mesh_dirty {
             let mut ui_dynamic_texts = peridot_vg::Context::new(e.rendering_precision());
-            self.mem
-                .construct_new_ui_fill_rect_vertices(e.graphics_mut(), |vs| {
-                    for c in &[
-                        &self.ui_roughness_slider,
-                        &self.ui_anisotropic_slider,
-                        &self.ui_metallic_slider,
-                        &self.ui_reflectance_slider,
-                    ] {
-                        c.render_dynamic(&mut ui_dynamic_texts);
-                        c.render_dynamic_mesh(vs);
-                    }
-                });
-            let ui_dynamic_buffers =
-                UIRenderingBuffers::new(e.graphics(), &ui_dynamic_texts, &mut self.last_frame_tfb)
-                    .expect("Failed to allocate ui dynamic buffers");
-            let mut dub = peridot::DescriptorSetUpdateBatch::new();
-            dub.write(
-                self.descriptors.descriptor(6).unwrap(),
-                0,
-                br::DescriptorUpdateInfo::UniformTexelBuffer(vec![ui_dynamic_buffers
-                    .transform_buffer_view()
-                    .native_ptr()]),
+            self.mem.construct_new_ui_fill_rect_vertices(e, |vs| {
+                for c in &[
+                    &self.ui_roughness_slider,
+                    &self.ui_anisotropic_slider,
+                    &self.ui_metallic_slider,
+                    &self.ui_reflectance_slider,
+                ] {
+                    c.render_dynamic(&mut ui_dynamic_texts);
+                    c.render_dynamic_mesh(vs);
+                }
+            });
+            let ui_dynamic_buffers = UIRenderingBuffers::new(
+                e.graphics(),
+                &mut self.mem.manager,
+                &ui_dynamic_texts,
+                &mut self.last_frame_tfb,
+            )
+            .expect("Failed to allocate ui dynamic buffers");
+            e.graphics().update_descriptor_sets(
+                &[self.descriptors.descriptor(6).unwrap().write(
+                    br::DescriptorContents::UniformTexelBuffer(vec![br::VkHandleRef::new(
+                        ui_dynamic_buffers.transform_buffer_view(),
+                    )]),
+                )],
+                &[],
             );
-            dub.submit(&e.graphics());
             self.render_bundles[4]
                 .reset()
                 .expect("Failed to reset dynamic ui render bundles");
-            for n in 0..e.backbuffer_count() {
+            for n in 0..e.back_buffer_count() {
                 Self::repopulate_dynamic_ui_render_commands(
                     e,
                     self.render_bundles[4].synchronized(n),
@@ -2471,7 +2594,7 @@ where
                     &self.screen_res,
                     n,
                     &ui_dynamic_buffers,
-                    self.descriptors.descriptor(6).unwrap(),
+                    self.descriptors.raw_descriptor(6).unwrap(),
                 );
             }
             self.command_buffers
@@ -2492,41 +2615,41 @@ where
         }
 
         self.mem
-            .ready_transfer(e.graphics(), &mut self.last_frame_tfb);
-        self.mem.dynamic_stg.clear();
-        let update_submission =
-            if self.last_frame_tfb.has_copy_ops() || self.last_frame_tfb.has_ready_barrier_ops() {
-                self.update_commands
-                    .reset()
-                    .expect("Failed to reset update commands");
-                unsafe {
-                    let mut r = self.update_commands[0]
-                        .begin()
-                        .expect("Failed to begin recording update commands");
-                    self.last_frame_tfb.sink_transfer_commands(&mut r);
-                    self.last_frame_tfb.sink_graphics_ready_commands(&mut r);
-                }
+            .ready_transfer(e.graphics(), &mut self.last_frame_tfb2);
+        let update_submission = if self.last_frame_tfb.has_copy_ops()
+            || self.last_frame_tfb.has_ready_barrier_ops()
+            || self.last_frame_tfb2.has_ops()
+        {
+            self.update_commands
+                .reset()
+                .expect("Failed to reset update commands");
+            unsafe {
+                let mut r = self.update_commands[0]
+                    .begin()
+                    .expect("Failed to begin recording update commands");
+                self.last_frame_tfb.sink_transfer_commands(&mut r);
+                self.last_frame_tfb.sink_graphics_ready_commands(&mut r);
+                self.last_frame_tfb2.generate_commands(&mut r);
+                r.end().expect("Failed to finish update commands");
+            }
 
-                Some(br::SubmissionBatch {
-                    command_buffers: std::borrow::Cow::Borrowed(&self.update_commands[..]),
-                    ..Default::default()
-                })
-            } else {
-                None
-            };
+            Some(br::EmptySubmissionBatch.with_command_buffers(&self.update_commands[..]))
+        } else {
+            None
+        };
 
-        (
+        e.do_render(
+            on_backbuffer_of,
             update_submission,
-            br::SubmissionBatch {
-                command_buffers: std::borrow::Cow::Borrowed(
-                    &self.command_buffers[on_backbuffer_of as usize..on_backbuffer_of as usize + 1],
-                ),
-                ..Default::default()
-            },
+            br::EmptySubmissionBatch.with_command_buffers(
+                &self.command_buffers[on_backbuffer_of as usize..=on_backbuffer_of as usize],
+            ),
         )
+        .expect("Failed to present");
+        self.mem.dynamic_stg.clear();
     }
 
-    fn discard_backbuffer_resources(&mut self) {
+    fn discard_back_buffer_resources(&mut self) {
         self.command_buffers
             .reset()
             .expect("Failed to reset screen commands");
@@ -2537,7 +2660,7 @@ where
         self.screen_res.frame_buffers.clear();
     }
     fn on_resize(&mut self, e: &mut peridot::Engine<NL>, new_size: peridot::math::Vector2<usize>) {
-        self.screen_res = ScreenResources::new(e, &self.const_res);
+        self.screen_res = ScreenResources::new(e, &mut self.mem.manager, &self.const_res);
 
         rayon::scope(|s| {
             let (rb0, rb1, rb2, rb3, rb4, rb5) = match &mut self.render_bundles[..] {
@@ -2548,53 +2671,53 @@ where
             };
 
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_ui_mask_render_commands(
                         e,
                         rb0.synchronized(n),
                         &self.const_res.render_pass,
                         &self.screen_res,
                         n,
-                        &self.mem.mem.buffer.0,
-                        self.descriptors.descriptor(5).unwrap(),
+                        &self.mem.mem.buffer.object,
+                        self.descriptors.raw_descriptor(5).unwrap(),
                         &self.mem.ui_mask_render_params,
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_grid_render_commands(
                         e,
                         rb1.synchronized(n),
                         &self.const_res.render_pass,
                         &self.screen_res,
                         n,
-                        &self.mem.mem.buffer.0,
+                        &self.mem.mem.buffer.object,
                         &self.mem.static_offsets,
-                        self.descriptors.descriptor(0).unwrap(),
+                        self.descriptors.raw_descriptor(0).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_pbr_object_render_commands(
                         e,
                         rb2.synchronized(n),
                         &self.const_res.render_pass,
                         &self.screen_res,
                         n,
-                        &self.mem.mem.buffer.0,
+                        &self.mem.mem.buffer.object,
                         &self.mem.static_offsets,
                         self.mem.icosphere_vertex_count as _,
-                        self.descriptors.descriptor(1).unwrap(),
-                        self.descriptors.descriptor(2).unwrap(),
-                        self.descriptors.descriptor(3).unwrap(),
-                        self.descriptors.descriptor(10).unwrap(),
+                        self.descriptors.raw_descriptor(1).unwrap(),
+                        self.descriptors.raw_descriptor(2).unwrap(),
+                        self.descriptors.raw_descriptor(3).unwrap(),
+                        self.descriptors.raw_descriptor(10).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_static_ui_render_commands(
                         e,
                         rb3.synchronized(n),
@@ -2602,17 +2725,17 @@ where
                         &self.screen_res,
                         n,
                         &self.mem.ui_render_params,
-                        &self.mem.mem.buffer.0,
+                        &self.mem.mem.buffer.object,
                         &self.mem.static_offsets,
                         &self.mem.mutable_offsets,
                         self.mem.mem.mut_buffer_placement,
-                        self.descriptors.descriptor(7).unwrap(),
-                        self.descriptors.descriptor(4).unwrap(),
+                        self.descriptors.raw_descriptor(7).unwrap(),
+                        self.descriptors.raw_descriptor(4).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_dynamic_ui_render_commands(
                         e,
                         rb4.synchronized(n),
@@ -2620,23 +2743,23 @@ where
                         &self.screen_res,
                         n,
                         &self.ui_dynamic_buffers,
-                        self.descriptors.descriptor(6).unwrap(),
+                        self.descriptors.raw_descriptor(6).unwrap(),
                     );
                 }
             });
             s.spawn(|_| {
-                for n in 0..e.backbuffer_count() {
+                for n in 0..e.back_buffer_count() {
                     Self::repopulate_skybox_render_commands(
                         e,
                         rb5.synchronized(n),
                         &self.const_res.render_pass,
                         &self.screen_res,
                         n,
-                        &self.mem.mem.buffer.0,
+                        &self.mem.mem.buffer.object,
                         &self.mem.static_offsets,
                         &[
-                            self.descriptors.descriptor(8).unwrap().into(),
-                            self.descriptors.descriptor(9).unwrap().into(),
+                            self.descriptors.raw_descriptor(8).unwrap().into(),
+                            self.descriptors.raw_descriptor(9).unwrap().into(),
                         ],
                     )
                 }
@@ -2659,7 +2782,7 @@ where
         let new_aspect = new_size.0 as f32 / new_size.1 as f32;
         self.main_camera.camera.modify().1 = new_aspect;
         self.mem.set_ui_transform(
-            e.graphics_mut(),
+            e,
             peridot::math::Camera {
                 projection: Some(peridot::math::ProjectionMethod::UI {
                     design_width: new_size.0 as _,
@@ -2674,11 +2797,14 @@ where
 impl<NL: peridot::NativeLinker> Game<NL> {
     fn repopulate_ui_mask_render_commands(
         engine: &peridot::Engine<NL>,
-        mut command_buffer: br::SynchronizedCommandBuffer,
-        renderpass: &br::RenderPass,
+        mut command_buffer: br::SynchronizedCommandBuffer<
+            br::CommandPoolObject<peridot::DeviceObject>,
+            br::CommandBufferObject<peridot::DeviceObject>,
+        >,
+        renderpass: &br::RenderPassObject<peridot::DeviceObject>,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
-        device_buffer: &peridot::Buffer,
+        device_buffer: &impl br::Buffer<ConcreteDevice = peridot::DeviceObject>,
         transform_buffer_desc: br::DescriptorSet,
         render_params: &peridot_vg::RendererParams,
     ) {
@@ -2701,15 +2827,20 @@ impl<NL: peridot::NativeLinker> Game<NL> {
                 target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
             },
         );
+
+        rec.end().expect("Failed to finish ui mask render commands");
     }
 
     fn repopulate_grid_render_commands(
         engine: &peridot::Engine<NL>,
-        mut command_buffer: br::SynchronizedCommandBuffer,
-        renderpass: &br::RenderPass,
+        mut command_buffer: br::SynchronizedCommandBuffer<
+            impl br::CommandPool + br::VkHandleMut,
+            impl br::CommandBuffer + br::VkHandleMut,
+        >,
+        renderpass: &br::RenderPassObject<peridot::DeviceObject>,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
-        device_buffer: &br::Buffer,
+        device_buffer: &impl br::Buffer,
         static_offsets: &StaticBufferOffsets,
         grid_transform_desc: br::DescriptorSet,
     ) {
@@ -2724,19 +2855,36 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             )
             .expect("Failed to initiate grid render bundle recording");
 
-        screen_res.grid_render_pipeline.bind(&mut rec);
-        rec.bind_graphics_descriptor_sets(0, &[grid_transform_desc.into()], &[]);
-        rec.bind_vertex_buffers(0, &[(device_buffer, static_offsets.grid as _)]);
-        rec.draw(mesh::GRID_MESH_LINE_COUNT as _, 1, 0, 0);
+        let descriptor_sets = DescriptorSets(vec![grid_transform_desc.into()]);
+        let mesh = StandardMesh {
+            vertex_buffers: vec![RangedBuffer::from_offset_length(
+                device_buffer,
+                static_offsets.grid,
+                1,
+            )],
+            vertex_count: mesh::GRID_MESH_LINE_COUNT as _,
+        };
+
+        let setup = (
+            &screen_res.grid_render_pipeline,
+            descriptor_sets.bind_graphics(),
+        );
+        mesh.draw(1)
+            .after_of(setup)
+            .execute_and_finish(rec.as_dyn_ref())
+            .expect("Failed to record grid rendering commands");
     }
 
     fn repopulate_pbr_object_render_commands(
         engine: &peridot::Engine<NL>,
-        mut command_buffer: br::SynchronizedCommandBuffer,
-        renderpass: &br::RenderPass,
+        mut command_buffer: br::SynchronizedCommandBuffer<
+            impl br::CommandPool + br::VkHandleMut,
+            impl br::CommandBuffer + br::VkHandleMut,
+        >,
+        renderpass: &br::RenderPassObject<peridot::DeviceObject>,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
-        device_buffer: &br::Buffer,
+        device_buffer: &impl br::Buffer,
         static_offsets: &StaticBufferOffsets,
         icosphere_vertex_count: u32,
         object_transform_desc: br::DescriptorSet,
@@ -2755,37 +2903,45 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             )
             .expect("Failed to initiate pbr object render bundle recording");
 
-        screen_res.pbr_pipeline.bind(&mut rec);
-        rec.bind_graphics_descriptor_sets(
-            0,
-            &[
-                object_transform_desc.into(),
-                rasterization_scene_info_desc.into(),
-                material_info_desc.into(),
-                precomputed_map_desc.into(),
-            ],
-            &[],
-        );
-        rec.bind_vertex_buffers(
-            0,
-            &[(device_buffer, static_offsets.icosphere_vertices as _)],
-        );
-        rec.bind_index_buffer(
-            device_buffer,
-            static_offsets.icosphere_indices as _,
-            br::IndexType::U16,
-        );
-        rec.draw_indexed(icosphere_vertex_count, 1, 0, 0, 0);
+        let descriptor_sets = DescriptorSets(vec![
+            object_transform_desc.into(),
+            rasterization_scene_info_desc.into(),
+            material_info_desc.into(),
+            precomputed_map_desc.into(),
+        ]);
+        let mesh = StandardIndexedMesh {
+            vertex_buffers: vec![RangedBuffer::from_offset_length(
+                device_buffer,
+                static_offsets.icosphere_vertices,
+                1,
+            )],
+            index_buffer: RangedBuffer::from_offset_length(
+                device_buffer,
+                static_offsets.icosphere_indices,
+                1,
+            ),
+            index_type: br::IndexType::U16,
+            vertex_count: icosphere_vertex_count,
+        };
+
+        let setup = (&screen_res.pbr_pipeline, descriptor_sets.bind_graphics());
+        mesh.draw(1)
+            .after_of(setup)
+            .execute_and_finish(rec.as_dyn_ref())
+            .expect("Failed to finish pbr object render commands");
     }
 
     fn repopulate_static_ui_render_commands(
         engine: &peridot::Engine<NL>,
-        mut command_buffer: br::SynchronizedCommandBuffer,
-        renderpass: &br::RenderPass,
+        mut command_buffer: br::SynchronizedCommandBuffer<
+            impl br::CommandPool + br::VkHandleMut,
+            impl br::CommandBuffer + br::VkHandleMut,
+        >,
+        renderpass: &br::RenderPassObject<peridot::DeviceObject>,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
         render_params: &peridot_vg::RendererParams,
-        device_buffer: &peridot::Buffer,
+        device_buffer: &impl br::Buffer<ConcreteDevice = peridot::DeviceObject>,
         static_offsets: &StaticBufferOffsets,
         mutable_offsets: &MutableBufferOffsets,
         mut_buffer_placement: u64,
@@ -2800,31 +2956,50 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             )
             .expect("Failed to initiate static ui render bundle recording");
 
-        screen_res.ui_fill_rect_pipeline.bind(&mut rec);
-        rec.bind_graphics_descriptor_sets(0, &[fill_rect_transform_desc.into()], &[]);
-        rec.bind_vertex_buffers(
-            0,
-            &[(
+        let descriptor_sets = DescriptorSets(vec![fill_rect_transform_desc.into()]);
+        let set_fill_rect_color = PushConstant::for_fragment(0, [1.0f32, 1.0, 1.0, 0.25]);
+        let set_border_rect_color = PushConstant::for_fragment(0, [1.0f32, 1.0, 1.0, 1.0]);
+        let fill_rect_mesh = StandardIndexedMesh {
+            vertex_buffers: vec![RangedBuffer::from_offset_length(
                 device_buffer,
-                (mutable_offsets.ui_fill_rects + mut_buffer_placement) as _,
+                mutable_offsets.ui_fill_rects + mut_buffer_placement,
+                1,
             )],
-        );
-        rec.bind_index_buffer(
-            device_buffer,
-            static_offsets.ui_fill_rect_indices as _,
-            br::IndexType::U16,
-        );
-        rec.push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &[1.0f32, 1.0, 1.0, 0.25]);
-        rec.draw_indexed(mesh::UI_FILL_RECT_INDEX_COUNT as _, 1, 0, 0, 0);
+            index_buffer: RangedBuffer::from_offset_length(
+                device_buffer,
+                static_offsets.ui_fill_rect_indices,
+                1,
+            ),
+            index_type: br::IndexType::U16,
+            vertex_count: mesh::UI_FILL_RECT_INDEX_COUNT as _,
+        };
+        let border_rect_mesh = StandardIndexedMesh {
+            vertex_buffers: vec![RangedBuffer::from_offset_length(
+                device_buffer,
+                mutable_offsets.ui_fill_rects + mut_buffer_placement,
+                1,
+            )],
+            index_buffer: RangedBuffer::from_offset_length(
+                device_buffer,
+                static_offsets.ui_border_line_indices,
+                1,
+            ),
+            index_type: br::IndexType::U16,
+            vertex_count: mesh::UI_FILL_RECT_BORDER_INDEX_COUNT as _,
+        };
 
-        screen_res.ui_border_line_pipeline.bind(&mut rec);
-        rec.bind_index_buffer(
-            device_buffer,
-            static_offsets.ui_border_line_indices as _,
-            br::IndexType::U16,
-        );
-        rec.push_graphics_constant(br::ShaderStage::FRAGMENT, 0, &[1.0f32, 1.0, 1.0, 1.0]);
-        rec.draw_indexed(mesh::UI_FILL_RECT_BORDER_INDEX_COUNT as _, 1, 0, 0, 0);
+        let fill_render = fill_rect_mesh.draw(1).after_of((
+            &screen_res.ui_fill_rect_pipeline,
+            descriptor_sets.bind_graphics(),
+            set_fill_rect_color,
+        ));
+        let border_render = border_rect_mesh
+            .draw(1)
+            .after_of((&screen_res.ui_border_line_pipeline, set_border_rect_color));
+
+        fill_render
+            .then(border_render)
+            .execute(&mut rec.as_dyn_ref());
 
         render_params.default_render_commands(
             engine,
@@ -2837,12 +3012,18 @@ impl<NL: peridot::NativeLinker> Game<NL> {
                 target_pixels: peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
             },
         );
+
+        rec.end()
+            .expect("Failed to finish static ui render commands");
     }
 
     fn repopulate_dynamic_ui_render_commands(
         engine: &peridot::Engine<NL>,
-        mut command_buffer: br::SynchronizedCommandBuffer,
-        renderpass: &br::RenderPass,
+        mut command_buffer: br::SynchronizedCommandBuffer<
+            br::CommandPoolObject<peridot::DeviceObject>,
+            br::CommandBufferObject<peridot::DeviceObject>,
+        >,
+        renderpass: &br::RenderPassObject<peridot::DeviceObject>,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
         ui_dynamic_buffers: &UIRenderingBuffers,
@@ -2863,15 +3044,21 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             transform_desc,
             peridot::math::Vector2(fb.size().width as _, fb.size().height as _),
         );
+
+        rec.end()
+            .expect("Failed to finish dynamic ui render commands");
     }
 
     fn repopulate_skybox_render_commands(
         engine: &peridot::Engine<NL>,
-        mut command_buffer: br::SynchronizedCommandBuffer,
-        renderpass: &br::RenderPass,
+        mut command_buffer: br::SynchronizedCommandBuffer<
+            impl br::CommandPool + br::VkHandleMut,
+            impl br::CommandBuffer + br::VkHandleMut,
+        >,
+        renderpass: &br::RenderPassObject<peridot::DeviceObject>,
         screen_res: &ScreenResources,
         frame_buffer_index: usize,
-        device_buffer: &br::Buffer,
+        device_buffer: &impl br::Buffer,
         static_offsets: &StaticBufferOffsets,
         descriptors: &[br::vk::VkDescriptorSet],
     ) {
@@ -2883,21 +3070,35 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             )
             .expect("Failed to initiate skybox rendering");
 
-        screen_res.skybox_render_pipeline.bind(&mut rc);
-        rc.bind_graphics_descriptor_sets(0, descriptors, &[]);
-        rc.bind_vertex_buffers(0, &[(device_buffer, static_offsets.skybox_cube as _)]);
-        rc.bind_index_buffer(
-            device_buffer,
-            static_offsets.skybox_cube_indices as _,
-            br::IndexType::U16,
+        let mesh = StandardIndexedMesh {
+            vertex_buffers: vec![RangedBuffer::from_offset_length(
+                device_buffer,
+                static_offsets.skybox_cube,
+                1,
+            )],
+            index_buffer: RangedBuffer::from_offset_length(
+                device_buffer,
+                static_offsets.skybox_cube_indices,
+                1,
+            ),
+            index_type: br::IndexType::U16,
+            vertex_count: 36,
+        };
+
+        let setup = (
+            &screen_res.skybox_render_pipeline,
+            BindGraphicsDescriptorSets::new(descriptors),
         );
-        rc.draw_indexed(36, 1, 0, 0, 0);
+        mesh.draw(1)
+            .after_of(setup)
+            .execute_and_finish(rc.as_dyn_ref())
+            .expect("Failed to finish skybox render commands");
     }
 
     fn repopulate_screen_commands(
         engine: &peridot::Engine<NL>,
         render_area: br::vk::VkRect2D,
-        command_buffers: &mut peridot::CommandBundle,
+        command_buffers: &mut peridot::CommandBundle<peridot::DeviceObject>,
         const_res: &ConstResources,
         screen_res: &ScreenResources,
         render_bundles: &[RenderBundle],
@@ -2908,29 +3109,26 @@ impl<NL: peridot::NativeLinker> Game<NL> {
             .enumerate()
         {
             let mut r = unsafe { cb.begin().expect("Failed to begin command recording") };
-            r.begin_render_pass(
-                &const_res.render_pass,
-                fb,
-                render_area.clone(),
-                &[
+
+            let rp = BeginRenderPass::new(&const_res.render_pass, fb, render_area.clone())
+                .with_clear_values(vec![
                     br::ClearValue::color_f32([0.25 * 0.25, 0.5 * 0.25, 1.0 * 0.25, 1.0]),
                     br::ClearValue::depth_stencil(1.0, 0),
-                ],
-                false,
-            );
-            unsafe {
-                r.execute_commands(&[render_bundles[0].buffers[n].native_ptr()]);
-            }
-            r.next_subpass(false);
-            unsafe {
-                r.execute_commands(
-                    &render_bundles[1..]
-                        .iter()
-                        .map(|b| b.buffers[n].native_ptr())
-                        .collect::<Vec<_>>(),
-                );
-            }
-            r.end_render_pass();
+                ]);
+            let pre_stencil_pass_commands = [render_bundles[0].buffers[n].native_ptr()];
+            let color_pass_commands = render_bundles[1..]
+                .iter()
+                .map(|b| b.buffers[n].native_ptr())
+                .collect::<Vec<_>>();
+
+            (
+                pre_stencil_pass_commands,
+                NextSubpass::WITH_COMMAND_BUFFER_EXECUTIONS,
+                color_pass_commands,
+            )
+                .between(rp.non_inline_commands(), EndRenderPass)
+                .execute_and_finish(r.as_dyn_ref())
+                .expect("Failed to record main commands");
         }
     }
 }
