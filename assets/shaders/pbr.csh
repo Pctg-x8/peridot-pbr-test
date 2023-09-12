@@ -13,6 +13,9 @@ Header[FragmentShader] {
     const float PI = 3.1415926f;
     const float MAX_IBL_REFLECTION_LOD = 4.0f;
 
+    // PBR Fragment Shader
+    // based: https://learnopengl.com/PBR/Lighting https://google.github.io/filament/Filament.html 
+
     // Subset of Disney Principled BRDF Functions
     float DistributionGGXAnisotropic(vec3 h) {
         const vec2 alpha = max(vec2(0.001, 0.001), vec2(roughness * (1.0 + anisotropic), roughness * (1.0 - anisotropic)));
