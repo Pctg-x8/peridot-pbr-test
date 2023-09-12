@@ -11,30 +11,30 @@ VertexShader {
 
 Header[FragmentShader] {
     const float PI = 3.1415926f;
+    const float MAX_IBL_REFLECTION_LOD = 4.0f;
 
     // Subset of Disney Principled BRDF Functions
     float DistributionGGXAnisotropic(vec3 h) {
-        const vec2 alpha = max(vec2(0.001, 0.001), vec2(pow(roughness, 2.0) * (1.0 + anisotropic), pow(roughness, 2.0) * (1.0 - anisotropic)));
+        const vec2 alpha = max(vec2(0.001, 0.001), vec2(roughness * (1.0 + anisotropic), roughness * (1.0 - anisotropic)));
 
-        /*
         const float th = dot(tangent_v, h);
         const float bh = dot(binormal_v, h);
-        const float nh = clamp(dot(normal_v, h), 0.0, 1.0);
+        const float nh = dot(normal_v, h);
         const float a2 = alpha.x * alpha.y;
         const vec3 v = vec3(alpha.y * th, alpha.x * bh, a2 * nh);
         const float v2 = dot(v, v);
         const float w2 = a2 / v2;
 
-        return a2 * w2 * w2 / PI;*/
+        return a2 * w2 * w2 / PI;
 
-        // GGX Anisotropic Model
+        /*// GGX Anisotropic Model
         const float th2 = pow(abs(dot(tangent_v, h)), 2.0);
         const float bh2 = pow(abs(dot(binormal_v, h)), 2.0);
         const float nm2 = pow(abs(dot(normal_v, h)), 2.0);
         const float denom1 = (th2 / pow(alpha.x, 2.0)) + (bh2 / pow(alpha.y, 2.0)) + nm2;
         const float denom = PI * alpha.x * alpha.y * denom1 * denom1;
 
-        return 1.0 / denom;
+        return 1.0 / denom;*/
 
         /*const float a = roughness * roughness;
         // (nh^2 * a^2 - nh^2 + 1) ^ 2
@@ -57,7 +57,7 @@ Header[FragmentShader] {
     }
 
     float GeometryMasking1(vec3 u, vec3 m) {
-        const vec2 alpha = max(vec2(0.001, 0.001), vec2(pow(roughness, 2.0) * (1.0 + anisotropic), pow(roughness, 2.0) * (1.0 - anisotropic)));
+        const vec2 alpha = max(vec2(0.001, 0.001), vec2(roughness * (1.0 + anisotropic), roughness * (1.0 - anisotropic)));
         const mat3 a = mat3(alpha.x, 0.0f, 0.0f, 0.0f, alpha.y, 0.0f, 0.0f, 0.0f, 1.0f);
 
         const vec3 anV = a * normal_v;
@@ -72,14 +72,28 @@ Header[FragmentShader] {
 
     // Smiths method with GGX
     float GeometryVisibility(vec3 light, vec3 outDir) {
-        const float a = roughness * roughness;
+        /*const float a = roughness * roughness;
         const float a2 = a * a;
         const float nl = clamp(dot(normal_v, light), 0.0, 1.0);
         const float nv = abs(dot(normal_v, outDir)) + 1e-5;
         const float denomLight = nl * sqrt(nv * nv * (1.0 - a2) + a2);
         const float denomView = nv * sqrt(nl * nl * (1.0 - a2) + a2);
 
-        return 0.5 / max(denomLight + denomView, 1e-6);
+        return 0.5 / max(denomLight + denomView, 1e-6);*/
+        
+        // from filament anisotropic model
+        const vec2 alpha = max(vec2(0.001, 0.001), vec2(roughness * (1.0 + anisotropic), roughness * (1.0 - anisotropic)));
+        const float ndl = max(0.0f, dot(normal_v, light));
+        const float tdl = max(0.0f, dot(tangent_v, light));
+        const float bdl = max(0.0f, dot(binormal_v, light));
+        const float ndv = max(0.0f, dot(normal_v, outDir));
+        const float tdv = max(0.0f, dot(tangent_v, outDir));
+        const float bdv = max(0.0f, dot(binormal_v, outDir));
+        /*const float lv = ndl * length(vec3(alpha.x * tdv, alpha.y * bdv, ndv));
+        const float ll = ndv * length(vec3(alpha.x * tdl, alpha.y * bdl, ndl));*/
+        const float lv = ndl * (ndv * (1.0f - roughness) + roughness);
+        const float ll = ndv * (ndl * (1.0f - roughness) + roughness);
+        return min(0.5 / (lv + ll), 65504.0f);
     }
 
     // Schlicks approximation method
@@ -95,8 +109,7 @@ Header[FragmentShader] {
     }
 
     vec3 SpecularBRDF(vec3 light, vec3 outDir, vec3 albedo) {
-        const vec3 h = normalize(outDir + light * vec3(1.0, -1.0, 1.0));
-        const float denom = 4.0f * abs(dot(light, normal_v)) * abs(dot(outDir, normal_v));
+        const vec3 h = normalize(outDir + light);
 
         return vec3(DistributionGGXAnisotropic(h) * GeometryVisibility(light, outDir)) * Fresnel(outDir, h, albedo);
     }
@@ -126,20 +139,37 @@ Header[FragmentShader] {
         const vec3 albedo = baseColor.xyz;
         const vec3 kd = (1.0 - Fresnel(outDir, h, albedo)) * (1.0 - metallic);
         const vec3 diffuse = DiffuseBRDF(ndv, clamp(ndl, 0.0, 1.0), ldh, roughness, albedo);
-        const vec3 brdf = (diffuse * kd + SpecularBRDF(normalize(lightDir.xyz), outDir, albedo)) * lightIntensity.xyz * dot(normal_v, lightDir.xyz);
+        const vec3 brdf = (diffuse * kd + SpecularBRDF(lightDir.xyz, outDir, albedo)) * lightIntensity.xyz * dot(normal_v, lightDir.xyz);
         // const vec3 brdf = DiffuseBRDF(albedo);
 
         return brdf;
     }
 
     vec3 CalcImageLightReflectIntensity(vec3 outDir) {
-        return max(texture(envIrradianceMap, normal_v).rgb, 0.0) * baseColor.xyz;
+        const vec3 h = normalize(outDir + lightDir.xyz);
+        const vec3 albedo = baseColor.xyz;
+
+        // bending normal for anisotropic: https://google.github.io/filament/Filament.html#lighting/imagebasedlights/anisotropy
+        const vec3 anisoTan = cross(binormal_v, outDir);
+        const vec3 anisoNormal = cross(anisoTan, binormal_v);
+        const vec3 bentNormal = normalize(mix(normal_v, anisoNormal, anisotropic));
+
+        const vec3 f = Fresnel(outDir, h, albedo);
+        const vec3 kd = (1.0f - f) * (1.0f - metallic);
+
+        const vec3 diffuse = texture(envIrradianceMap, bentNormal).xyz * albedo;
+
+        const vec2 envBRDF = texture(envPrecomputedBRDF, vec2(max(0.0f, dot(bentNormal, outDir)), roughness)).xy;
+        const vec3 specular = (f * envBRDF.x + envBRDF.y) * textureLod(envPrefilteredMap, reflect(-outDir, bentNormal), roughness * MAX_IBL_REFLECTION_LOD).xyz;
+
+        return kd * diffuse + specular;
     }
 }
 FragmentShader {
+    // outdir: raster point to camera ray (outgoing from surface)
     const vec3 outDir = normalize(cameraPos.xyz - worldPos.xyz);
     Target[0] = vec4(CalcImageLightReflectIntensity(outDir) + CalcDirectionalLightReflectIntensity(outDir), 1.0) * baseColor.a;
-    // Target[0] = vec4(normalize(outDir + lightDir.xyz) * 0.5f + 0.5f, 1.0f);
+    // Target[0] = vec4(binormal_v * 0.5f + 0.5f, 1.0f);
 }
 
 Varyings VertexShader -> FragmentShader {
@@ -161,3 +191,5 @@ Uniform[FragmentShader](2, 0) Material {
     float roughness, anisotropic, metallic, reflectance;
 }
 SamplerCube[FragmentShader](3, 0) envIrradianceMap
+SamplerCube[FragmentShader](3, 1) envPrefilteredMap
+Sampler2D[FragmentShader](3, 2) envPrecomputedBRDF

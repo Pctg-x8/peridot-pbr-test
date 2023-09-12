@@ -1,3 +1,5 @@
+use peridot::math::One;
+
 const GRID_SIZE: usize = 10;
 const GRID_AXIS_LENGTH: f32 = 100.0;
 const fn colored_line_mesh(
@@ -79,12 +81,12 @@ pub fn build_grid_mesh_into(dest: &mut [[peridot::ColoredVertex; 2]]) {
 }
 
 fn normalize3(v: peridot::math::Vector4<f32>) -> peridot::math::Vector4F32 {
-    let peridot::math::Vector3(x, y, z) = peridot::math::Vector3::from(v).normalize();
-    peridot::math::Vector4(x, y, z, 1.0)
+    let peridot::math::Vector3(x, y, z) = peridot::math::Vector3(v.0, v.1, v.2).normalize();
+    peridot::math::Vector4(x, y, z, v.3)
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VertexWithNormals {
     pos: peridot::math::Vector4F32,
     normal: peridot::math::Vector4F32,
@@ -125,23 +127,66 @@ impl UnitIcosphere {
                 .chain(xy_planes.into_iter())
                 .chain(yz_planes.into_iter())
                 .map(|p| {
-                    let n3 = peridot::math::Vector3::from(p.clone()).normalize();
-                    let ax = peridot::math::Vector3::up().cross(&n3);
-                    let q = peridot::math::Quaternion(
-                        ax.0,
-                        ax.1,
-                        ax.2,
-                        1.0 + peridot::math::Vector3::up().dot(n3.clone()),
-                    )
-                    .normalize();
-                    let rot = peridot::math::Matrix4::from(q);
+                    let n = peridot::math::Vector3::from(p.clone()).normalize();
+
+                    // compute tangents by spherical coordinates: https://computergraphics.stackexchange.com/a/5499
+                    let phi = n.2.atan2(n.0);
+
+                    let t = peridot::math::Vector3(-phi.sin(), 0.0, phi.cos());
+                    let b = n.cross(&t);
 
                     VertexWithNormals {
-                        normal: peridot::math::Vector4(n3.0, n3.1, n3.2, 0.0),
-                        tangent: rot.clone() * peridot::math::Vector4(1.0, 0.0, 0.0, 0.0),
-                        binormal: rot * peridot::math::Vector4(0.0, 0.0, 1.0, 0.0),
+                        normal: n.with_w(0.0),
+                        tangent: t.with_w(0.0),
+                        binormal: b.with_w(0.0),
                         pos: normalize3(p),
                     }
+
+                    // let ax = peridot::math::Vector3::forward().cross(&n3);
+                    // let q = if n3 == peridot::math::Vector3::back() {
+                    //     // rev
+                    //     peridot::math::Quaternion::new(
+                    //         180.0f32.to_radians(),
+                    //         peridot::math::Vector3::back(),
+                    //     )
+                    // } else if ax.len2() == 0.0 {
+                    //     // samedir
+                    //     peridot::math::Quaternion::new(
+                    //         0.0f32.to_radians(),
+                    //         peridot::math::Vector3::back(),
+                    //     )
+                    // } else {
+                    //     peridot::math::Quaternion(
+                    //         // TODO: Matrix4::fromが行と列逆なので後で直す
+                    //         -ax.0,
+                    //         -ax.1,
+                    //         -ax.2,
+                    //         1.0 + peridot::math::Vector3::forward().dot(n3.clone()),
+                    //     )
+                    //     .normalize()
+                    // };
+                    // let rot = peridot::math::Matrix4::from(q);
+
+                    // VertexWithNormals {
+                    //     normal: peridot::math::Vector4(n3.0, n3.1, n3.2, 0.0),
+                    //     tangent: rot.clone() * peridot::math::Vector4(1.0, 0.0, 0.0, 0.0),
+                    //     binormal: rot * peridot::math::Vector4(0.0, 1.0, 0.0, 0.0),
+                    //     pos: normalize3(p),
+                    // }
+
+                    // let n = peridot::math::Vector3::from(p.clone()).normalize();
+                    // let x1 = n.clone().cross(&peridot::math::Vector3::up());
+                    // let x2 = n.clone().cross(&peridot::math::Vector3::forward());
+
+                    // let t = if x1.len2() > x2.len2() { x1 } else { x2 };
+                    // let b = t.clone().cross(&n);
+
+                    // VertexWithNormals {
+                    //     normal: n.with_w(0.0),
+                    //     tangent: t.with_w(0.0),
+                    //     binormal: b.with_w(0.0),
+                    //     pos: normalize3(p),
+                    // }
                 })
                 .collect(),
             indices: vec![
@@ -158,27 +203,90 @@ impl UnitIcosphere {
         let mut midpoint_index = |index1: u16, index2: u16| {
             *midpoints.entry((index1, index2)).or_insert_with(|| {
                 let index = vertices.len() as u16;
-                let p = normalize3(
-                    (vertices[index1 as usize].pos + vertices[index2 as usize].pos) * 0.5,
-                );
+                let mut p =
+                    normalize3(vertices[index1 as usize].pos + vertices[index2 as usize].pos);
+                p.3 = 1.0;
+                // let n =
+                //     normalize3(vertices[index1 as usize].normal + vertices[index2 as usize].normal);
+                // let t = normalize3(
+                //     vertices[index1 as usize].tangent + vertices[index2 as usize].tangent,
+                // );
+                // let b = normalize3(
+                //     vertices[index1 as usize].binormal + vertices[index2 as usize].binormal,
+                // );
 
-                let n3 = peridot::math::Vector3::from(p.clone()).normalize();
-                let ax = peridot::math::Vector3::up().cross(&n3);
-                let q = peridot::math::Quaternion(
-                    ax.0,
-                    ax.1,
-                    ax.2,
-                    1.0 + peridot::math::Vector3::up().dot(n3.clone()),
-                )
-                .normalize();
-                let rot = peridot::math::Matrix4::from(q);
+                // vertices.push(VertexWithNormals {
+                //     normal: n,
+                //     tangent: t,
+                //     binormal: b,
+                //     pos: p,
+                // });
+
+                let n = peridot::math::Vector3::from(p);
+
+                // compute tangents by spherical coordinates: https://computergraphics.stackexchange.com/a/5499
+                let phi = n.2.atan2(n.0);
+
+                let t = peridot::math::Vector3(-phi.sin(), 0.0, phi.cos());
+                let b = n.cross(&t);
 
                 vertices.push(VertexWithNormals {
-                    normal: peridot::math::Vector4(n3.0, n3.1, n3.2, 0.0),
-                    tangent: rot.clone() * peridot::math::Vector4(1.0, 0.0, 0.0, 0.0),
-                    binormal: rot * peridot::math::Vector4(0.0, 0.0, 1.0, 0.0),
-                    pos: p,
+                    normal: n.with_w(0.0),
+                    tangent: t.with_w(0.0),
+                    binormal: b.with_w(0.0),
+                    pos: normalize3(p),
                 });
+
+                // let n3 = peridot::math::Vector3::from(p.clone()).normalize();
+                // let ax = peridot::math::Vector3::forward().cross(&n3);
+                // let q = if n3 == peridot::math::Vector3::back() {
+                //     // rev
+                //     peridot::math::Quaternion::new(
+                //         180.0f32.to_radians(),
+                //         peridot::math::Vector3::back(),
+                //     )
+                // } else if ax.len2() == 0.0 {
+                //     // samedir
+                //     peridot::math::Quaternion::new(
+                //         0.0f32.to_radians(),
+                //         peridot::math::Vector3::back(),
+                //     )
+                // } else {
+                //     // TODO: Matrix4::fromが行と列逆なので後で直す
+                //     peridot::math::Quaternion(
+                //         -ax.0,
+                //         -ax.1,
+                //         -ax.2,
+                //         1.0 + peridot::math::Vector3::forward().dot(n3.clone()),
+                //     )
+                //     .normalize()
+                // };
+                // let rot = peridot::math::Matrix4::from(q);
+                // println!(
+                //     "n {n3:?} r {:?}",
+                //     rot.clone() * peridot::math::Vector4(0.0, 1.0, 0.0, 0.0)
+                // );
+
+                // vertices.push(VertexWithNormals {
+                //     normal: peridot::math::Vector4(n3.0, n3.1, n3.2, 0.0),
+                //     tangent: rot.clone() * peridot::math::Vector4(1.0, 0.0, 0.0, 0.0),
+                //     binormal: rot * peridot::math::Vector4(0.0, 1.0, 0.0, 0.0),
+                //     pos: p,
+                // });
+
+                // let n = peridot::math::Vector3::from(p.clone()).normalize();
+                // let x1 = n.clone().cross(&peridot::math::Vector3::up());
+                // let x2 = n.clone().cross(&peridot::math::Vector3::forward());
+
+                // let t = if x1.len2() > x2.len2() { x1 } else { x2 }.normalize();
+                // let b = t.clone().cross(&n);
+
+                // vertices.push(VertexWithNormals {
+                //     normal: n.with_w(0.0),
+                //     tangent: t.with_w(0.0),
+                //     binormal: b.with_w(0.0),
+                //     pos: normalize3(p),
+                // });
 
                 index
             })

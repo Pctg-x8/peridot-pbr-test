@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -11,12 +11,10 @@ use peridot::math::One;
 use peridot::mthelper::{DynamicMutabilityProvider, SharedRef};
 use peridot::{self, DefaultRenderCommands, ModelData};
 use peridot_command_object::{
-    BeginRenderPass, BindGraphicsDescriptorSets, Blending, BufferUsage,
-    BufferUsageTransitionBarrier, ColorAttachmentBlending, CopyBuffer, DescriptorSets,
-    EndRenderPass, GraphicsCommand, GraphicsCommandCombiner, GraphicsCommandSubmission,
-    IndexedMesh, Mesh, NextSubpass, PipelineBarrier, PipelineBarrierEntry, PushConstant,
-    RangedBuffer, RangedImage, SimpleDraw, StandardIndexedMesh, StandardMesh,
-    ViewportWithScissorRect,
+    BeginRenderPass, BindGraphicsDescriptorSets, Blending, BufferUsage, ColorAttachmentBlending,
+    DescriptorSets, EndRenderPass, GraphicsCommand, GraphicsCommandCombiner,
+    GraphicsCommandSubmission, NextSubpass, PipelineBarrier, PushConstant, RangedBuffer,
+    RangedImage, SimpleDraw, StandardIndexedMesh, StandardMesh, ViewportWithScissorRect,
 };
 use peridot_memory_manager::MemoryManager;
 use peridot_vertex_processing_pack::*;
@@ -134,8 +132,10 @@ pub struct ConstResources {
     dsl_ub2_f: DetailedDescriptorSetLayout,
     dsl_utb1: DetailedDescriptorSetLayout,
     dsl_ics1_f: DetailedDescriptorSetLayout,
+    dsl_precomputed_set: DetailedDescriptorSetLayout,
     #[allow(dead_code)]
     linear_sampler: br::SamplerObject<peridot::DeviceObject>,
+    _prefiltered_env_sampler: br::SamplerObject<peridot::DeviceObject>,
     unlit_colored_shader: PvpShaderModules<'static, peridot::DeviceObject>,
     unlit_colored_pipeline_layout: Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
     pbr_shader: PvpShaderModules<'static, peridot::DeviceObject>,
@@ -193,9 +193,24 @@ impl ConstResources {
             .create(e.graphics().device().clone())
             .expect("Failed to create render pass");
 
-        let linear_sampler = br::SamplerBuilder::default()
+        let linear_sampler = br::SamplerBuilder::new()
+            .addressing(
+                br::AddressingMode::ClampToEdge,
+                br::AddressingMode::ClampToEdge,
+                br::AddressingMode::ClampToEdge,
+            )
             .create(e.graphics().device().clone())
             .expect("Failed to create DefaultSampler");
+        let prefiltered_env_sampler = br::SamplerBuilder::new()
+            .addressing(
+                br::AddressingMode::ClampToEdge,
+                br::AddressingMode::ClampToEdge,
+                br::AddressingMode::ClampToEdge,
+            )
+            .filter(br::FilterMode::Linear, br::FilterMode::Linear)
+            .mip_filter(br::MipmapFilterMode::Linear)
+            .create(e.graphics().device().clone())
+            .expect("Failed to create Prefiltered Env Sampler");
         let dsl_ub1 = DetailedDescriptorSetLayout::new(
             e.graphics(),
             vec![br::DescriptorType::UniformBuffer
@@ -237,6 +252,26 @@ impl ConstResources {
                 .with_immutable_samplers(vec![br::SamplerObjectRef::new(&linear_sampler)])],
         )
         .expect("Failed to create ics1_f descriptor set layout");
+        let dsl_precomputed_set = DetailedDescriptorSetLayout::new(
+            e.graphics(),
+            vec![
+                br::DescriptorType::CombinedImageSampler
+                    .make_binding(1)
+                    .only_for_fragment()
+                    .with_immutable_samplers(vec![br::SamplerObjectRef::new(&linear_sampler)]),
+                br::DescriptorType::CombinedImageSampler
+                    .make_binding(1)
+                    .only_for_fragment()
+                    .with_immutable_samplers(vec![br::SamplerObjectRef::new(
+                        &prefiltered_env_sampler,
+                    )]),
+                br::DescriptorType::CombinedImageSampler
+                    .make_binding(1)
+                    .only_for_fragment()
+                    .with_immutable_samplers(vec![br::SamplerObjectRef::new(&linear_sampler)]),
+            ],
+        )
+        .expect("Failed to create descriptor set layout");
 
         let unlit_colored_shader = PvpShaderModules::new(
             e.graphics().device(),
@@ -260,7 +295,7 @@ impl ConstResources {
                 &dsl_ub1.object,
                 &dsl_ub2_f.object,
                 &dsl_ub1_f.object,
-                &dsl_ics1_f.object,
+                &dsl_precomputed_set.object,
             ],
             vec![],
         )
@@ -316,11 +351,13 @@ impl ConstResources {
         Self {
             render_pass,
             linear_sampler,
+            _prefiltered_env_sampler: prefiltered_env_sampler,
             dsl_ub1,
             dsl_ub1_f,
             dsl_ub2_f,
             dsl_utb1,
             dsl_ics1_f,
+            dsl_precomputed_set,
             unlit_colored_shader,
             unlit_colored_pipeline_layout,
             pbr_shader,
@@ -337,12 +374,7 @@ impl ConstResources {
 }
 
 pub struct ScreenResources {
-    frame_buffers: Vec<
-        br::FramebufferObject<
-            peridot::DeviceObject,
-            SharedRef<dyn br::ImageView<ConcreteDevice = peridot::DeviceObject> + Sync + Send>,
-        >,
-    >,
+    frame_buffers: Vec<br::FramebufferObject<'static, peridot::DeviceObject>>,
     grid_render_pipeline: peridot::LayoutedPipeline<
         br::PipelineObject<peridot::DeviceObject>,
         Arc<br::PipelineLayoutObject<peridot::DeviceObject>>,
@@ -433,23 +465,9 @@ impl ScreenResources {
         let frame_buffers: Vec<_> = e
             .iter_back_buffers()
             .map(|b| {
-                e.graphics()
-                    .device()
-                    .clone()
-                    .new_framebuffer(
-                        &const_res.render_pass,
-                        vec![
-                            b.clone()
-                                as Arc<
-                                    dyn br::ImageView<ConcreteDevice = peridot::DeviceObject>
-                                        + Send
-                                        + Sync,
-                                >,
-                            depth_texture_view.clone(),
-                        ],
-                        b.image().size().as_ref(),
-                        1,
-                    )
+                br::FramebufferBuilder::new_with_attachment(&const_res.render_pass, b.clone())
+                    .with_attachment(depth_texture_view.clone())
+                    .create()
                     .expect("Failed to create framebuffer")
             })
             .collect();
@@ -816,6 +834,7 @@ impl UpdateSets {
 
 const PREFILTERED_ENVMAP_MIP_LEVELS: u32 = 5;
 const PREFILTERED_ENVMAP_SIZE: u32 = 128;
+const PRECOMPUTED_ENV_BRDF_LUT_SIZE: u32 = 512;
 
 pub struct Memory {
     manager: MemoryManager,
@@ -851,7 +870,8 @@ pub struct Memory {
     >,
     dwt_ibl_cubemap: br::ImageViewObject<peridot_memory_manager::Image>,
     dwt_irradiance_cubemap: br::ImageViewObject<peridot_memory_manager::Image>,
-    dwt_prefiltered_envmap: peridot_memory_manager::Image,
+    dwt_prefiltered_envmap: br::ImageViewObject<peridot_memory_manager::Image>,
+    dwt_precomputed_env_brdf_lut: br::ImageViewObject<peridot_memory_manager::Image>,
 }
 impl Memory {
     pub fn new(
@@ -932,41 +952,51 @@ impl Memory {
         let ui_render_params = initializer.ui_render_params.unwrap();
         let ui_mask_render_params = initializer.ui_mask_render_params.unwrap();
 
-        let dwts = manager
-            .allocate_multiple_device_local_images(
-                e.graphics(),
-                [
-                    br::ImageDesc::new(
-                        peridot::math::Vector2(512u32, 512),
-                        peridot::PixelFormat::RGBA64F as _,
-                        br::ImageUsage::COLOR_ATTACHMENT.sampled(),
-                        br::ImageLayout::Undefined,
-                    )
-                    .flags(br::ImageFlags::CUBE_COMPATIBLE)
-                    .array_layers(6),
-                    br::ImageDesc::new(
-                        peridot::math::Vector2(32u32, 32),
-                        peridot::PixelFormat::RGBA64F as _,
-                        br::ImageUsage::COLOR_ATTACHMENT.sampled(),
-                        br::ImageLayout::Undefined,
-                    )
-                    .flags(br::ImageFlags::CUBE_COMPATIBLE)
-                    .array_layers(6),
-                    br::ImageDesc::new(
-                        peridot::math::Vector2(PREFILTERED_ENVMAP_SIZE, PREFILTERED_ENVMAP_SIZE),
-                        peridot::PixelFormat::RGBA64F as _,
-                        br::ImageUsage::COLOR_ATTACHMENT.sampled(),
-                        br::ImageLayout::Undefined,
-                    )
-                    .flags(br::ImageFlags::CUBE_COMPATIBLE)
-                    .array_layers(6)
-                    .mip_levels(PREFILTERED_ENVMAP_MIP_LEVELS),
-                ],
-            )
-            .expect("Failed to allocate dwts");
-        let Ok::<[_; 3], _>([dwt_ibl_cubemap, dwt_irradiance_cubemap, dwt_prefiltered_envmap]) = dwts.try_into() else {
-            unreachable!("unknown combination");
-        };
+        let [dwt_ibl_cubemap, dwt_irradiance_cubemap, dwt_prefiltered_envmap, dwt_precomputed_env_brdf_lut] =
+            manager
+                .allocate_device_local_image_array(
+                    e.graphics(),
+                    [
+                        br::ImageDesc::new(
+                            peridot::math::Vector2(512u32, 512),
+                            peridot::PixelFormat::RGBA64F as _,
+                            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+                            br::ImageLayout::Undefined,
+                        )
+                        .flags(br::ImageFlags::CUBE_COMPATIBLE)
+                        .array_layers(6),
+                        br::ImageDesc::new(
+                            peridot::math::Vector2(32u32, 32),
+                            peridot::PixelFormat::RGBA64F as _,
+                            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+                            br::ImageLayout::Undefined,
+                        )
+                        .flags(br::ImageFlags::CUBE_COMPATIBLE)
+                        .array_layers(6),
+                        br::ImageDesc::new(
+                            peridot::math::Vector2(
+                                PREFILTERED_ENVMAP_SIZE,
+                                PREFILTERED_ENVMAP_SIZE,
+                            ),
+                            peridot::PixelFormat::RGBA64F as _,
+                            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+                            br::ImageLayout::Undefined,
+                        )
+                        .flags(br::ImageFlags::CUBE_COMPATIBLE)
+                        .array_layers(6)
+                        .mip_levels(PREFILTERED_ENVMAP_MIP_LEVELS),
+                        br::ImageDesc::new(
+                            peridot::math::Vector2(
+                                PRECOMPUTED_ENV_BRDF_LUT_SIZE,
+                                PRECOMPUTED_ENV_BRDF_LUT_SIZE,
+                            ),
+                            peridot::PixelFormat::RG16 as _,
+                            br::ImageUsage::COLOR_ATTACHMENT.sampled(),
+                            br::ImageLayout::Undefined,
+                        ),
+                    ],
+                )
+                .expect("Failed to allocate dwts");
 
         Self {
             dynamic_stg: DynamicStagingBuffer::new(e.graphics(), &mut manager)
@@ -1009,7 +1039,21 @@ impl Memory {
                 .with_dimension(br::vk::VK_IMAGE_VIEW_TYPE_CUBE)
                 .create()
                 .expect("Failed to create irradiance cubemap view"),
-            dwt_prefiltered_envmap,
+            dwt_prefiltered_envmap: dwt_prefiltered_envmap
+                .subresource_range(
+                    br::AspectMask::COLOR,
+                    0..PREFILTERED_ENVMAP_MIP_LEVELS,
+                    0..6,
+                )
+                .view_builder()
+                .with_dimension(br::vk::VK_IMAGE_VIEW_TYPE_CUBE)
+                .create()
+                .expect("Failed to create prefiltered envmap view"),
+            dwt_precomputed_env_brdf_lut: dwt_precomputed_env_brdf_lut
+                .subresource_range(br::AspectMask::COLOR, 0..1, 0..1)
+                .view_builder()
+                .create()
+                .expect("Failed to create precomputed env brdf lut view"),
         }
     }
 
@@ -1109,7 +1153,6 @@ impl Memory {
         tfb: &mut peridot::TransferBatch2,
     ) {
         self.dynamic_stg.end_mapped(e);
-        let get_dynamic_stg_buffer = || self.dynamic_stg.buffer().borrow();
 
         if let Some(o) = self.update_sets.grid_mvp_stg_offset.take() {
             let target_offset = self.mem.mut_buffer_placement + self.mutable_offsets.grid_mvp;
@@ -1848,6 +1891,31 @@ where
         }
         m0.end();
 
+        let brdf_precompute_rp = br::RenderPassBuilder::new()
+            .add_attachment(
+                br::AttachmentDescription::new(
+                    peridot::PixelFormat::RG16 as _,
+                    br::ImageLayout::Undefined,
+                    br::ImageLayout::ShaderReadOnlyOpt,
+                )
+                .store_op(br::StoreOp::Store),
+            )
+            .add_subpass(br::SubpassDescription::new().add_color_output(
+                0,
+                br::ImageLayout::ColorAttachmentOpt,
+                None,
+            ))
+            .add_dependency(br::vk::VkSubpassDependency {
+                srcSubpass: 0,
+                dstSubpass: br::vk::VK_SUBPASS_EXTERNAL,
+                srcStageMask: br::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.0,
+                dstStageMask: br::PipelineStageFlags::FRAGMENT_SHADER.0,
+                srcAccessMask: br::AccessFlags::COLOR_ATTACHMENT.write,
+                dstAccessMask: br::AccessFlags::SHADER.read,
+                dependencyFlags: br::vk::VK_DEPENDENCY_BY_REGION_BIT,
+            })
+            .create(e.graphics().device().clone())
+            .expect("Failed to create brdf precompute passes");
         let precompute_rp = br::RenderPassBuilder::new()
             .add_attachment(
                 br::AttachmentDescription::new(
@@ -1877,16 +1945,12 @@ where
             .map(|l| {
                 let iv = mem
                     .dwt_ibl_cubemap
-                    .by_ref()
+                    .image()
                     .subresource_range(br::AspectMask::COLOR, 0..1, l..l + 1)
                     .view_builder()
                     .create()?;
-                let s = iv.size().as_ref();
 
-                e.graphics()
-                    .device()
-                    .clone()
-                    .new_framebuffer(&precompute_rp, vec![iv], s, 1)
+                br::FramebufferBuilder::new_with_attachment(&precompute_rp, iv).create()
             })
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to create equirect to cubemap frame buffer");
@@ -1898,12 +1962,8 @@ where
                     .subresource_range(br::AspectMask::COLOR, 0..1, l..l + 1)
                     .view_builder()
                     .create()?;
-                let s = iv.size().as_ref();
 
-                e.graphics()
-                    .device()
-                    .clone()
-                    .new_framebuffer(&precompute_rp, vec![iv], s, 1)
+                br::FramebufferBuilder::new_with_attachment(&precompute_rp, iv).create()
             })
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to create irradiance precompute frame buffer");
@@ -1916,21 +1976,27 @@ where
                     .subresource_range(br::AspectMask::COLOR, ml..ml + 1, d..d + 1)
                     .view_builder()
                     .create()?;
+                let size = PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _);
 
-                e.graphics().device().clone().new_framebuffer(
-                    &precompute_rp,
-                    vec![iv],
-                    &br::vk::VkExtent2D {
-                        width: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _)) as _,
-                        height: (PREFILTERED_ENVMAP_SIZE as f32 * 0.5f32.powi(ml as _)) as _,
-                    },
-                    1,
-                )
+                br::FramebufferBuilder::new_with_attachment(&precompute_rp, iv)
+                    .size(size as _, size as _)
+                    .create()
             })
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to create prefiltered envmap frame buffer");
+        let precompute_env_brdf_lut_fb = br::FramebufferBuilder::new_with_attachment(
+            &brdf_precompute_rp,
+            mem.dwt_precomputed_env_brdf_lut
+                .by_ref()
+                .subresource_range(br::AspectMask::COLOR, 0..1, 0..1)
+                .view_builder()
+                .create()
+                .expect("Failed to create image view"),
+        )
+        .create()
+        .expect("Failed to create precompute env-brdf framebuffer");
 
-        let equirect_to_cubemap_shader = peridot_vertex_processing_pack::PvpShaderModules::new(
+        let equirect_to_cubemap_shader = PvpShaderModules::new(
             e.graphics().device(),
             e.load("shaders.equirectangular_to_cubemap")
                 .expect("Failed to load equirectangular to cubemap shader"),
@@ -1948,6 +2014,13 @@ where
                 .expect("Failed to load envmap prefilter shader"),
         )
         .expect("Failed to create envmap prefilter shader modules");
+        let precompute_env_brdf_shader = PvpShaderModules::new(
+            e.graphics().device(),
+            e.load("shaders.precompute_env_brdf")
+                .expect("missing shader"),
+        )
+        .expect("Failed to create brdf precompute shader");
+
         let linear_smp = br::SamplerBuilder::default()
             .create(e.graphics().device().clone())
             .expect("Failed to default sampler");
@@ -1959,6 +2032,9 @@ where
                 .with_immutable_samplers(vec![br::SamplerObjectRef::new(&linear_smp)])],
         )
         .expect("Failed to create equirectangular to cubemap descriptor set layout");
+        let empty_pl = br::PipelineLayoutBuilder::new(vec![], vec![])
+            .create(e.graphics().device().clone())
+            .expect("Failed to create empty pipeline layout");
         let precompute_common_pl = br::PipelineLayoutBuilder::new(vec![&dsl.object], vec![])
             .create(e.graphics().device().clone())
             .expect("Failed to create precompute common pipeline layout");
@@ -2056,6 +2132,40 @@ where
                 None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
             )
             .expect("Failed to create envmap prefilter pipeline");
+        let mut precompute_env_brdf_pipeline = br::GraphicsPipelineBuilder::<
+            _,
+            br::PipelineObject<peridot::DeviceObject>,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >::new(
+            &empty_pl,
+            (&brdf_precompute_rp, 0),
+            precompute_env_brdf_shader.generate_vps(br::vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP),
+        );
+        precompute_env_brdf_pipeline
+            .viewport_scissors(
+                br::DynamicArrayState::Static(&[br::vk::VkExtent2D::spread1(
+                    PRECOMPUTED_ENV_BRDF_LUT_SIZE,
+                )
+                .into_rect(br::vk::VkOffset2D::ZERO)
+                .make_viewport(0.0..1.0)]),
+                br::DynamicArrayState::Static(&[br::vk::VkExtent2D::spread1(
+                    PRECOMPUTED_ENV_BRDF_LUT_SIZE,
+                )
+                .into_rect(br::vk::VkOffset2D::ZERO)]),
+            )
+            .add_attachment_blend(br::AttachmentColorBlendState::noblend())
+            .multisample_state(Some(br::MultisampleState::new()));
+        let precompute_env_brdf_pipeline = precompute_env_brdf_pipeline
+            .create(
+                e.graphics().device().clone(),
+                None::<&br::PipelineCacheObject<peridot::DeviceObject>>,
+            )
+            .expect("Failed to create precompute env brdf pipeline");
 
         async_std::task::block_on(async {
             let cubemap_precompute_meshes = (0..6)
@@ -2209,13 +2319,46 @@ where
                     r
                 })
                 .expect("Failed to submit prefilter envmap commands");
+            let precompute_env_brdf_task = e
+                .submit_commands_async(|mut r| {
+                    let begin_render_pass = BeginRenderPass::for_entire_framebuffer(
+                        &brdf_precompute_rp,
+                        &precompute_env_brdf_lut_fb,
+                    );
+                    let pipeline = peridot::LayoutedPipeline::combine(
+                        &precompute_env_brdf_pipeline,
+                        &empty_pl,
+                    );
+                    let fill_mesh = StandardMesh {
+                        vertex_buffers: vec![RangedBuffer::from_offset_length(
+                            &buffer,
+                            fillrect_offset,
+                            1,
+                        )],
+                        vertex_count: 4,
+                    };
 
-            let (a, b) = futures_util::join!(irradiance_precompute_task, prefilter_envmap_task);
-            a.or(b).expect("Failed to precompute envmaps");
+                    fill_mesh
+                        .draw(1)
+                        .after_of(pipeline)
+                        .between(begin_render_pass, EndRenderPass)
+                        .execute(&mut r.as_dyn_ref());
+
+                    r
+                })
+                .expect("Failed to submit precompute env brdf commands");
+
+            let (a, b, c) = futures_util::join!(
+                irradiance_precompute_task,
+                prefilter_envmap_task,
+                precompute_env_brdf_task
+            );
+            a.or(b).or(c).expect("Failed to precompute tasks");
         });
         // keep alive resources while command execution
         drop(tmp_loaded_image_mem);
         drop(buffer);
+        drop(precompute_env_brdf_lut_fb);
         drop(prefiltered_envmap_fbs);
         drop(irradiance_precompute_fbs);
         drop(equirect_to_cubemap_fbs);
@@ -2234,7 +2377,7 @@ where
                 &const_res.dsl_ub1,
                 &const_res.dsl_ub1,
                 &const_res.dsl_ics1_f,
-                &const_res.dsl_ics1_f,
+                &const_res.dsl_precomputed_set,
             ],
         )
         .expect("Failed to allocate descriptors");
@@ -2307,13 +2450,21 @@ where
                         br::ImageLayout::ShaderReadOnlyOpt,
                     ),
                 ])),
-            descriptors.descriptor(10).unwrap().write(
-                br::DescriptorContents::CombinedImageSampler(vec![br::DescriptorImageRef::new(
-                    &mem.dwt_irradiance_cubemap,
-                    br::ImageLayout::ShaderReadOnlyOpt,
-                )]),
-            ),
         ]);
+        descriptor_writes.extend(descriptors.descriptor(10).unwrap().write_multiple([
+            br::DescriptorContents::CombinedImageSampler(vec![br::DescriptorImageRef::new(
+                &mem.dwt_irradiance_cubemap,
+                br::ImageLayout::ShaderReadOnlyOpt,
+            )]),
+            br::DescriptorContents::CombinedImageSampler(vec![br::DescriptorImageRef::new(
+                &mem.dwt_prefiltered_envmap,
+                br::ImageLayout::ShaderReadOnlyOpt,
+            )]),
+            br::DescriptorContents::CombinedImageSampler(vec![br::DescriptorImageRef::new(
+                &mem.dwt_precomputed_env_brdf_lut,
+                br::ImageLayout::ShaderReadOnlyOpt,
+            )]),
+        ]));
         e.graphics()
             .device()
             .update_descriptor_sets(&descriptor_writes, &[]);

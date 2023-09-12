@@ -5,5 +5,5 @@ TARGETS = $(patsubst %.csh,%.pvp,$(wildcard *.csh)) $(patsubst %.csh,%.pvp,$(wil
 .PHONY: all
 all: $(TARGETS)
 .csh.pvp:
-	../../../peridot/target/release/peridot-shaderbuild $<
+	../../../peridot/tools/target/release/peridot-shaderbuild $<
 

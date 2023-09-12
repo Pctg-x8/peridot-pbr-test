@@ -24,8 +24,11 @@ FragmentShader {
         const vec3 l = normalize(2.0f * dot(normal, h) * h - normal);
 
         const float ndl = max(0.0f, dot(normal, l));
-        sum += texture(environmentMap, l).rgb * ndl;
-        totalSampleCount += ndl;
+        if (ndl > 0.0f) {
+            // opt: omit texture sampling if this factor will not be affected
+            sum += texture(environmentMap, l).rgb * ndl;
+            totalSampleCount += ndl;
+        }
     }
 
     Target[0] = vec4(sum / totalSampleCount, 1.0f);
